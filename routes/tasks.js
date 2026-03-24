@@ -9,7 +9,7 @@ router.get('/', authMiddleware, async (req, res) => {
   try {
     let query = supabase
       .from('tasks')
-      .select('*, users(user_id), stores(store_name)')
+      .select('*, user:user_id(user_id, superior_name), store:store_id(store_name)')
       .order('created_at', { ascending: false });
 
     // agency 권한은 자신의 매장에만 접근 가능

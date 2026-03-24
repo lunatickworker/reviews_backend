@@ -4,14 +4,20 @@ const authMiddleware = require('../auth-middleware');
 
 const router = express.Router();
 
-// 현재 사용자의 매장 조회
+// 매장 조회 (관리자: 모든 매장, 일반 사용자: 자신의 매장)
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    let query = supabase
       .from('stores')
-      .select('*')
-      .eq('user_id', req.user.id)
+      .select('*, user:user_id(user_id, superior_name)')
       .order('created_at', { ascending: false });
+
+    // 관리자가 아니면 자신의 매장만 조회
+    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+      query = query.eq('user_id', req.user.id);
+    }
+
+    const { data, error } = await query;
 
     if (error) throw error;
 
