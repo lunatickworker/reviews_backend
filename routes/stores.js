@@ -31,7 +31,7 @@ router.get('/', authMiddleware, async (req, res) => {
 // 매장 생성 (현재 사용자)
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { storeName, address, reviewMessage } = req.body;
+    const { storeName, address, reviewMessage, dailyFrequency, totalCount } = req.body;
 
     if (!storeName) {
       return res.status(400).json({ error: '매장명을 입력하세요.' });
@@ -55,6 +55,8 @@ router.post('/', authMiddleware, async (req, res) => {
           store_name: storeName,
           address: address || null,
           review_message: reviewMessage || null,
+          daily_frequency: dailyFrequency || 1,
+          total_count: totalCount || 1,
           user_id: req.user.id,
           created_at: new Date().toISOString(),
         },
@@ -70,28 +72,24 @@ router.post('/', authMiddleware, async (req, res) => {
   }
 });
 
-// 매장 수정 (본인 매장만)
+// 매장 수정 (모든 사용자)
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
-    const { storeName, address, reviewMessage } = req.body;
+    const { storeName, address, reviewMessage, dailyFrequency, totalCount } = req.body;
 
     if (!storeName) {
       return res.status(400).json({ error: '매장명을 입력하세요.' });
     }
 
-    // 본인의 매장인지 확인
+    // 매장 존재 여부만 확인
     const { data: store, error: fetchError } = await supabase
       .from('stores')
-      .select('user_id')
+      .select('id')
       .eq('id', req.params.id)
       .single();
 
     if (fetchError || !store) {
       return res.status(404).json({ error: '매장을 찾을 수 없습니다.' });
-    }
-
-    if (store.user_id !== req.user.id) {
-      return res.status(403).json({ error: '권한이 없습니다.' });
     }
 
     const { data, error } = await supabase
@@ -100,6 +98,8 @@ router.put('/:id', authMiddleware, async (req, res) => {
         store_name: storeName,
         address: address || null,
         review_message: reviewMessage || null,
+        daily_frequency: dailyFrequency || 1,
+        total_count: totalCount || 1,
         updated_at: new Date().toISOString(),
       })
       .eq('id', req.params.id)
@@ -114,22 +114,18 @@ router.put('/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// 매장 삭제 (본인 매장만)
+// 매장 삭제 (모든 사용자)
 router.delete('/:id', authMiddleware, async (req, res) => {
   try {
-    // 본인의 매장인지 확인
+    // 매장 존재 여부만 확인
     const { data: store, error: fetchError } = await supabase
       .from('stores')
-      .select('user_id')
+      .select('id')
       .eq('id', req.params.id)
       .single();
 
     if (fetchError || !store) {
       return res.status(404).json({ error: '매장을 찾을 수 없습니다.' });
-    }
-
-    if (store.user_id !== req.user.id) {
-      return res.status(403).json({ error: '권한이 없습니다.' });
     }
 
     const { error } = await supabase

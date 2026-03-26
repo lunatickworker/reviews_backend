@@ -12,9 +12,11 @@ const userRoutes = require('./routes/users');
 const storeRoutes = require('./routes/stores');
 const taskRoutes = require('./routes/tasks');
 const reviewRoutes = require('./routes/reviews');
+const scheduleRoutes = require('./routes/schedules');
 const authMiddleware = require('./auth-middleware');
 const logger = require('./logger');
 const supabase = require('./supabaseClient');
+const { initScheduler } = require('./scheduler');
 
 const app = express();
 app.use(express.json());
@@ -52,6 +54,11 @@ app.use('/api/tasks', taskRoutes);
 app.use('/api/reviews', reviewRoutes);
 const logRoutes = require('./routes/logs');
 app.use('/api/logs', logRoutes);
+app.use('/api/schedules', scheduleRoutes);
+
+// 백그라운드 스케줄러 초기화
+initScheduler();
+console.log('✅ 자동 배포 스케줄러 활성화됨');
 
 // 랜덤 계정 선택
 function getRandomAccount() {
@@ -68,6 +75,214 @@ function getProfilePath(email) {
   return path.join(userDataDir, `profile_${emailHash}`);
 }
 
+// Supabase Storage에 스크린샷 업로드
+async function uploadScreenshot(screenshotBuffer, taskId, dbTaskId) {
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const fileName = `screenshots/${dbTaskId}_${timestamp}.png`;
+    
+    const { data, error } = await supabase.storage
+      .from('reviews')
+      .upload(fileName, screenshotBuffer, {
+        contentType: 'image/png',
+        upsert: false,
+      });
+
+    if (error) {
+      console.log(`[${taskId}] ⚠️ 스크린샷 업로드 실패: ${error.message}`);
+      await logger.warn(taskId, `⚠️ 스크린샷 업로드 실패: ${error.message}`);
+      return null;
+    }
+
+    // 공개 URL 생성
+    const { data: urlData } = supabase.storage
+      .from('reviews')
+      .getPublicUrl(fileName);
+
+    const screenshotUrl = urlData?.publicUrl;
+    
+    if (screenshotUrl) {
+      // DB에 스크린샷 URL 저장
+      await supabase
+        .from('tasks')
+        .update({ screenshot_url: screenshotUrl })
+        .eq('id', dbTaskId);
+
+      console.log(`[${taskId}] ✅ 스크린샷 업로드 완료: ${screenshotUrl}`);
+      await logger.info(taskId, `✅ 스크린샷 저장 완료`);
+      return screenshotUrl;
+    }
+  } catch (error) {
+    console.log(`[${taskId}] ⚠️ 스크린샷 처리 오류: ${error.message}`);
+    await logger.warn(taskId, `⚠️ 스크린샷 처리 오류: ${error.message}`);
+  }
+  return null;
+}
+
+// 🔧 내부 배포 엔드포인트 (scheduler용 - 인증 불필요)
+app.post('/api/deploy-internal', async (req, res) => {
+  const { shortUrl, notes, storeId, userId } = req.body;
+  if (!shortUrl) {
+    return res.status(400).json({ error: 'shortUrl is required' });
+  }
+
+  // 기본값 설정
+  const totalCount = 1;
+  let browser;
+
+  try {
+    // 1. store 정보 조회
+    let placeName = '로딩 중...';
+    const assignedUserId = userId || 'scheduler';
+    
+    if (storeId) {
+      const { data: storeData } = await supabase
+        .from('stores')
+        .select('id, store_name')
+        .eq('id', storeId)
+        .single();
+      
+      if (storeData && storeData.store_name) {
+        placeName = storeData.store_name;
+      }
+    }
+    
+    // 2. Task 생성
+    const tasksToInsert = [{
+      place_name: placeName,
+      status: 'in_progress',
+      review_status: 'pending',
+      image_status: 'pending',
+      current_step: '시작',
+      notes: notes ? notes.trim() : '',
+      store_id: storeId || null,
+      user_id: assignedUserId,
+      created_at: new Date().toISOString(),
+    }];
+
+    const { data: taskDataArray, error: taskError } = await supabase
+      .from('tasks')
+      .insert(tasksToInsert)
+      .select();
+
+    if (taskError) {
+      console.error('❌ Task 생성 오류:', taskError);
+      return res.status(500).json({ error: 'Task 생성 실패' });
+    }
+
+    const dbTaskId = taskDataArray[0].id;
+    const taskId = `task_${dbTaskId}`;
+    
+    // Task ID 업데이트
+    await supabase
+      .from('tasks')
+      .update({ task_id: taskId })
+      .eq('id', dbTaskId);
+
+    console.log(`📋 [내부 배포] Task 생성: ${taskId}, 매장: ${placeName}, 사용자: ${assignedUserId}`);
+    await logger.info(taskId, `📋 스케줄된 배포 시작: ${placeName}`);
+    
+    // 랜덤 Google 계정 선택
+    const account = getRandomAccount();
+    const workAccount = account.email.split('@')[0];
+    
+    await supabase
+      .from('tasks')
+      .update({ work_account: workAccount })
+      .eq('id', dbTaskId);
+
+    await logger.info(taskId, `사용 계정: ${account.email}`);
+
+    // 프로필 디렉토리 설정
+    const profileDir = path.join(
+      process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE, 'AppData', 'Local'),
+      'Playwright', 'google-maps-profiles'
+    );
+    
+    const safeEmail = account.email.replace(/[^a-z0-9]/gi, '_');
+    const profilePath = path.join(profileDir, safeEmail);
+    
+    if (!fs.existsSync(profilePath)) {
+      fs.mkdirSync(profilePath, { recursive: true });
+    }
+
+    const isFirstLogin = !fs.existsSync(path.join(profilePath, 'Default'));
+    
+    if (isFirstLogin) {
+      await logger.warn(taskId, '⚠️ 첫 로그인 - 수동 로그인 필요');
+      console.log(`[${taskId}] ⚠️ 첫 로그인 감지 - 스케줄 배포 스킵`);
+      
+      // 첫 로그인이면 스킵
+      await supabase
+        .from('tasks')
+        .update({ 
+          status: 'pending',
+          current_step: '로그인 필요'
+        })
+        .eq('id', dbTaskId);
+      
+      return res.json({
+        success: false,
+        message: '첫 로그인 필요 - 스케줄 배포 스킵',
+        taskId: taskId
+      });
+    }
+
+    // Chrome 실행
+    browser = await chromium.launchPersistentContext(profilePath, {
+      headless: false,
+      channel: 'chrome',
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--no-default-browser-check',
+        '--disable-sync',
+        '--disable-extensions',
+        '--disable-component-extensions-with-background-pages',
+        '--disable-default-apps',
+        '--disable-preconnect',
+      ],
+    });
+
+    const page = browser.pages()[0] || await browser.newPage();
+
+    // Stealth 모드
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      delete navigator.__proto__.webdriver;
+      window.addEventListener('error', (e) => {
+        if (e.filename && (e.filename.includes('chrome-extension') || e.message.includes('Origin not allowed'))) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }, true);
+      const originalError = console.error;
+      console.error = function(...args) {
+        if (args[0] && typeof args[0] === 'string' && !args[0].includes('chrome-extension')) {
+          originalError.apply(console, args);
+        }
+      };
+    });
+
+    console.log(`[${taskId}] 📱 저장된 세션으로 브라우저 오픈`);
+    await logger.info(taskId, '📱 저장된 세션으로 브라우저 오픈');
+
+    // 백그라운드에서 자동화 처리
+    backgroundTask(page, shortUrl, notes, account.email, browser, profilePath, userId, taskId);
+
+    res.json({
+      success: true,
+      message: '🎬 스케줄된 배포 시작됨',
+      taskId: taskId,
+      usedAccount: account.email
+    });
+
+  } catch (error) {
+    if (browser) await browser.close();
+    console.error('❌ 내부 배포 오류:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // 리뷰 배포 API (admin만 요청 가능) - 권한 체계 추가
 app.post('/api/automate-map', authMiddleware, async (req, res) => {
   // admin 권한 확인
@@ -75,29 +290,46 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
     return res.status(403).json({ error: 'admin 권한이 필요합니다.' });
   }
 
-  const { shortUrl, notes } = req.body;
+  const { shortUrl, notes, storeId, totalCount = 1 } = req.body;
   if (!shortUrl) return res.status(400).json({ error: 'shortUrl is required' });
 
   let browser;
   try {
-    // 1. 장소명 추출 (임시)
+    // 1. store 정보 조회 (storeId가 있으면)
     let placeName = '로딩 중...';
+    if (storeId) {
+      const { data: storeData } = await supabase
+        .from('stores')
+        .select('store_name')
+        .eq('id', storeId)
+        .single();
+      
+      if (storeData && storeData.store_name) {
+        placeName = storeData.store_name;
+      }
+    }
     
-    // 2. tasks 테이블에 새 작업 추가
-    const { data: taskData, error: taskError } = await supabase
+    // 2. totalCount만큼 tasks 생성
+    const taskIds = [];
+    const tasksToInsert = [];
+    
+    for (let i = 0; i < Math.max(1, totalCount); i++) {
+      tasksToInsert.push({
+        place_name: placeName,
+        status: i === 0 ? 'in_progress' : 'pending',     // 첫 번째만 진행중, 나머지는 대기
+        review_status: 'pending',
+        image_status: 'pending',
+        current_step: i === 0 ? '시작' : '대기중',
+        notes: notes ? notes.trim() : '',
+        store_id: storeId || null,  // ✅ 매장 ID 저장
+        user_id: req.user.id,
+        created_at: new Date().toISOString(),
+      });
+    }
+
+    const { data: taskDataArray, error: taskError } = await supabase
       .from('tasks')
-      .insert([
-        {
-          place_name: placeName,
-          status: 'in_progress',
-          review_status: 'pending',
-          image_status: 'pending',
-          current_step: '시작',
-          notes: notes ? notes.trim() : '',
-          user_id: req.user.id,
-          created_at: new Date().toISOString(),
-        }
-      ])
+      .insert(tasksToInsert)
       .select();
 
     if (taskError) {
@@ -105,25 +337,36 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
       return res.status(500).json({ error: '작업 생성에 실패했습니다.' });
     }
 
-    const dbTaskId = taskData[0].id;
+    // 첫 번째 task만 Playwright로 실행
+    const dbTaskId = taskDataArray[0].id;
     const taskId = `task_${dbTaskId}`;
     
-    // task_id 컬럼도 업데이트
-    await supabase
-      .from('tasks')
-      .update({ task_id: taskId })
-      .eq('id', dbTaskId);
+    // 모든 task의 task_id 업데이트
+    for (let i = 0; i < taskDataArray.length; i++) {
+      const dataTaskId = `task_${taskDataArray[i].id}`;
+      await supabase
+        .from('tasks')
+        .update({ task_id: dataTaskId })
+        .eq('id', taskDataArray[i].id);
+    }
 
-    console.log(`📋 새 작업 생성됨: ID=${dbTaskId}, taskId=${taskId}`);
+    console.log(`📋 ${totalCount}개 작업 생성됨: 첫 번째 ID=${dbTaskId}, taskId=${taskId}`);
     console.log(`📝 Notes: "${notes ? notes.trim() : '(없음)'}"`);
-    await logger.info(taskId, `작업 시작: shortUrl=${shortUrl}`, { user: req.user.id });
+    await logger.info(taskId, `배포 시작: ${totalCount}개 작업 생성, shortUrl=${shortUrl}`, { user: req.user.id, totalCount });
     if (notes) {
       await logger.info(taskId, `📝 메모: ${notes}`);
     }
 
     // 랜덤 계정 선택
     const account = getRandomAccount();
+    const workAccount = account.email.split('@')[0]; // 이메일에서 @ 앞부분 추출
     await logger.info(taskId, `사용 계정: ${account.email}`);
+    
+    // 첫 번째 task에만 work_account 업데이트
+    await supabase
+      .from('tasks')
+      .update({ work_account: workAccount })
+      .eq('id', dbTaskId);
 
     // 계정별 저장된 프로필 디렉토리 (첫 로그인만 수동, 이후는 자동)
     const profileDir = path.join(
@@ -240,15 +483,28 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
       await logger.info(taskId, '✅ 저장된 세션으로 자동 로그인됨');
     }
 
+    // work_account가 제대로 저장되었는지 확인
+    const { data: updatedTask } = await supabase
+      .from('tasks')
+      .select('work_account')
+      .eq('id', dbTaskId)
+      .single();
+
+    const savedWorkAccount = updatedTask?.work_account || workAccount;
+    console.log(`[${taskId}] ✅ work_account 저장됨: ${savedWorkAccount}`);
+
     // 백그라운드 처리 시작 (작업 ID 기록)
     backgroundTask(page, shortUrl, notes, account.email, browser, profilePath, req.user.id, taskId);
 
     res.json({
       placeName: '로딩 중...',
-      message: '✅ 자동화 시작됨. 브라우저에서 리뷰를 작성해주세요. (2분 후 자동 종료)',
+      message: `✅ 자동화 시작됨 (${totalCount}개 작업 생성). 브라우저에서 리뷰를 작성해주세요. (2분 후 자동 종료)`,
       usedAccount: account.email,
+      workAccount: savedWorkAccount,
       taskId: taskId,
-      dbTaskId: dbTaskId
+      dbTaskId: dbTaskId,
+      totalCount: totalCount,
+      createdTasks: totalCount
     });
 
   } catch (error) {
@@ -429,7 +685,44 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
             writeReviewClicked = true;
             console.log(`[${taskId}] ✅ 리뷰 작성 버튼 클릭 완료`);
             await logger.info(taskId, '✅ 리뷰 작성 버튼 클릭 완료');
-            await page.waitForTimeout(1500);
+            await page.waitForTimeout(2000);
+            
+            // 📊 페이지 상태 저장 (디버깅용)
+            try {
+              const htmlContent = await page.content();
+              const fs = require('fs');
+              const logPath = `${tempDir}/form_page_html_${taskId}.html`;
+              fs.writeFileSync(logPath, htmlContent);
+              console.log(`[${taskId}] 💾 페이지 HTML 저장됨: ${logPath}`);
+              
+              // 페이지의 모든 input, textarea, contenteditable 요소 로깅
+              const elementInfo = await page.evaluate(() => {
+                const info = {
+                  textareas: document.querySelectorAll('textarea').length,
+                  inputs: document.querySelectorAll('input[type="text"]').length,
+                  editables: document.querySelectorAll('[contenteditable="true"]').length,
+                  iframes: document.querySelectorAll('iframe').length,
+                  divs_with_role_textbox: document.querySelectorAll('div[role="textbox"]').length,
+                  all_textareas: Array.from(document.querySelectorAll('textarea')).map(el => ({
+                    class: el.className,
+                    id: el.id,
+                    placeholder: el.placeholder,
+                    ariaLabel: el.getAttribute('aria-label')
+                  })),
+                  all_inputs: Array.from(document.querySelectorAll('input[type="text"]')).map(el => ({
+                    class: el.className,
+                    id: el.id,
+                    placeholder: el.placeholder,
+                    ariaLabel: el.getAttribute('aria-label')
+                  }))
+                };
+                return info;
+              });
+              console.log(`[${taskId}] 📋 페이지 요소 정보:`, JSON.stringify(elementInfo, null, 2));
+            } catch (saveError) {
+              console.log(`[${taskId}] ⚠️ 페이지 HTML 저장 오류: ${saveError.message}`);
+            }
+            
             break;
           }
         }
@@ -452,29 +745,183 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
     try {
       await page.waitForTimeout(1000);
       
-      const iframe = page.frameLocator('iframe[class*="goog-reviews-write-widget"]');
-      const textarea = iframe.locator('textarea[aria-label="리뷰 입력"]');
-      const textareaCount = await textarea.count();
+      const reviewText = notes ? notes.trim() : '좋은 경험 감사합니다!';
+      let textInputSuccess = false;
       
-      if (textareaCount > 0) {
-        // 텍스트 입력 (notes 있으면 사용, 없으면 기본값)
-        const reviewText = notes ? notes.trim() : '좋은 경험 감사합니다!';
-        try {
-          await textarea.first().focus();
-          await textarea.first().fill(reviewText);
-          console.log(`[${taskId}] ✅ 리뷰 텍스트 입력 완료: "${reviewText}"`);
-          await logger.info(taskId, `✅ 리뷰 텍스트 입력 완료: "${reviewText}"`);
-          await page.waitForTimeout(300);
-        } catch (e1) {
+      // 방법 1: iframe 내 textarea 찾기
+      try {
+        console.log(`[${taskId}] 🔍 방법 1: iframe 내 textarea 탐색...`);
+        const iframes = await page.$$('iframe');
+        console.log(`[${taskId}] 검색된 iframe 개수: ${iframes.length}`);
+        
+        for (let i = 0; i < iframes.length; i++) {
           try {
-            await textarea.first().type(reviewText, { delay: 50 });
-            console.log(`[${taskId}] ✅ 리뷰 텍스트 입력 완료: "${reviewText}"`);
-            await logger.info(taskId, `✅ 리뷰 텍스트 입력 완료: "${reviewText}"`);
-          } catch (e2) {
-            console.log(`[${taskId}] ⚠️ 텍스트 입력 실패`);
-            await logger.warn(taskId, '⚠️ 텍스트 입력 실패');
+            const frameHandle = await page.$(`iframe:nth-of-type(${i + 1})`);
+            const frame = await frameHandle.contentFrame();
+            if (frame) {
+              const textareas = await frame.$$('textarea');
+              console.log(`[${taskId}] iframe ${i}: textarea 개수 = ${textareas.length}`);
+              if (textareas.length > 0) {
+                await frame.focus('textarea');
+                await frame.type('textarea', reviewText, { delay: 30 });
+                console.log(`[${taskId}] ✅ iframe ${i}의 textarea에 입력 완료`);
+                textInputSuccess = true;
+                break;
+              }
+            }
+          } catch (e) {
+            // 계속 시도
           }
         }
+      } catch (e1) {
+        console.log(`[${taskId}] ⚠️ 방법 1 실패: ${e1.message}`);
+      }
+      
+      // 방법 2: 페이지 전체 textarea 탐색
+      if (!textInputSuccess) {
+        try {
+          console.log(`[${taskId}] 🔍 방법 2: 페이지 전체 textarea 탐색...`);
+          const textareas = await page.$$('textarea');
+          console.log(`[${taskId}] 검색된 textarea 개수: ${textareas.length}`);
+          if (textareas.length > 0) {
+            await textareas[0].focus();
+            await textareas[0].type(reviewText, { delay: 30 });
+            console.log(`[${taskId}] ✅ textarea에 입력 완료`);
+            textInputSuccess = true;
+          }
+        } catch (e2) {
+          console.log(`[${taskId}] ⚠️ 방법 2 실패: ${e2.message}`);
+        }
+      }
+      
+      // 방법 3: contenteditable 요소 탐색
+      if (!textInputSuccess) {
+        try {
+          console.log(`[${taskId}] 🔍 방법 3: contenteditable 요소 탐색...`);
+          const editables = await page.$$('[contenteditable="true"]');
+          console.log(`[${taskId}] 검색된 contenteditable 개수: ${editables.length}`);
+          if (editables.length > 0) {
+            await editables[0].focus();
+            await editables[0].type(reviewText, { delay: 30 });
+            console.log(`[${taskId}] ✅ contenteditable에 입력 완료`);
+            textInputSuccess = true;
+          }
+        } catch (e3) {
+          console.log(`[${taskId}] ⚠️ 방법 3 실패: ${e3.message}`);
+        }
+      }
+      
+      // 방법 4: JavaScript evaluate로 직접 입력
+      if (!textInputSuccess) {
+        try {
+          console.log(`[${taskId}] 🔍 방법 4: JavaScript로 직접 입력...`);
+          const result = await page.evaluate((text) => {
+            // iframe 내부 탐색
+            const iframes = document.querySelectorAll('iframe');
+            for (const iframe of iframes) {
+              try {
+                const textarea = iframe.contentDocument?.querySelector('textarea');
+                if (textarea) {
+                  textarea.value = text;
+                  textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                  textarea.dispatchEvent(new Event('change', { bubbles: true }));
+                  return true;
+                }
+              } catch (e) {
+                // 계속
+              }
+            }
+            // 페이지 전체 textarea
+            const textarea = document.querySelector('textarea');
+            if (textarea) {
+              textarea.value = text;
+              textarea.dispatchEvent(new Event('input', { bubbles: true }));
+              textarea.dispatchEvent(new Event('change', { bubbles: true }));
+              return true;
+            }
+            return false;
+          }, reviewText);
+          
+          if (result) {
+            console.log(`[${taskId}] ✅ JavaScript로 입력 완료`);
+            textInputSuccess = true;
+          } else {
+            console.log(`[${taskId}] ⚠️ 방법 4 실패: textarea를 찾을 수 없음`);
+          }
+        } catch (e4) {
+          console.log(`[${taskId}] ⚠️ 방법 4 실패: ${e4.message}`);
+        }
+      }
+
+      // 🆕 방법 5: div[role="textbox"] 탐색 (Google Docs 스타일)
+      if (!textInputSuccess) {
+        try {
+          console.log(`[${taskId}] 🔍 방법 5: div[role="textbox"] 탐색...`);
+          const textboxes = await page.$$('div[role="textbox"]');
+          console.log(`[${taskId}] 검색된 textbox 개수: ${textboxes.length}`);
+          if (textboxes.length > 0) {
+            await textboxes[0].focus();
+            await textboxes[0].type(reviewText, { delay: 30 });
+            console.log(`[${taskId}] ✅ textbox에 입력 완료`);
+            textInputSuccess = true;
+          }
+        } catch (e5) {
+          console.log(`[${taskId}] ⚠️ 방법 5 실패: ${e5.message}`);
+        }
+      }
+
+      // 🆕 방법 6: input[type="text"] 탐색
+      if (!textInputSuccess) {
+        try {
+          console.log(`[${taskId}] 🔍 방법 6: input[type="text"] 탐색...`);
+          const textInputs = await page.$$('input[type="text"]');
+          console.log(`[${taskId}] 검색된 text input 개수: ${textInputs.length}`);
+          if (textInputs.length > 0) {
+            await textInputs[0].focus();
+            await textInputs[0].type(reviewText, { delay: 30 });
+            console.log(`[${taskId}] ✅ text input에 입력 완료`);
+            textInputSuccess = true;
+          }
+        } catch (e6) {
+          console.log(`[${taskId}] ⚠️ 방법 6 실패: ${e6.message}`);
+        }
+      }
+
+      // 🆕 방법 7: 모든 input 요소 탐색
+      if (!textInputSuccess) {
+        try {
+          console.log(`[${taskId}] 🔍 방법 7: 모든 input 요소 탐색...`);
+          const allInputs = await page.$$('input');
+          console.log(`[${taskId}] 검색된 input 개수: ${allInputs.length}`);
+          for (let i = 0; i < allInputs.length; i++) {
+            const inputType = await allInputs[i].evaluate(el => el.type);
+            const isVisible = await allInputs[i].evaluate(el => {
+              const rect = el.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            });
+            console.log(`[${taskId}] input[${i}]: type=${inputType}, visible=${isVisible}`);
+            
+            if (isVisible && !inputType.match(/button|submit|checkbox|radio/i)) {
+              await allInputs[i].focus();
+              await allInputs[i].type(reviewText, { delay: 30 });
+              console.log(`[${taskId}] ✅ input[${i}]에 입력 완료`);
+              textInputSuccess = true;
+              break;
+            }
+          }
+        } catch (e7) {
+          console.log(`[${taskId}] ⚠️ 방법 7 실패: ${e7.message}`);
+        }
+      }
+      
+      if (textInputSuccess) {
+        console.log(`[${taskId}] ✅ 리뷰 텍스트 입력 완료: "${reviewText}"`);
+        await logger.info(taskId, `✅ 리뷰 텍스트 입력 완료: "${reviewText}"`);
+        await page.waitForTimeout(500);
+      } else {
+        console.log(`[${taskId}] ❌ 리뷰 텍스트 입력 필드를 찾지 못함 (모든 방법 실패)`);
+        await logger.error(taskId, `❌ 입력 필드를 찾지 못함`);
+      }
         
         // 별점 선택
         console.log(`[${taskId}] ⭐ 별점 선택 중...`);
@@ -506,6 +953,19 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
             await logger.info(taskId, '✅ 별점 선택 완료');
             await page.waitForTimeout(500);
             
+            // 📸 스크린샷 촬영
+            console.log(`[${taskId}] 📸 스크린샷 촬영 중...`);
+            await logger.updateStatus(taskId, { current_step: '스크린샷 촬영' });
+            try {
+              const screenshotBuffer = await page.screenshot({ fullPage: false });
+              const dbTaskId = parseInt(taskId.replace('task_', ''));
+              await uploadScreenshot(screenshotBuffer, taskId, dbTaskId);
+              console.log(`[${taskId}] ✅ 스크린샷 완료`);
+            } catch (screenshotError) {
+              console.log(`[${taskId}] ⚠️ 스크린샷 오류: ${screenshotError.message}`);
+              await logger.warn(taskId, `⚠️ 스크린샷 오류: ${screenshotError.message}`);
+            }
+            
             // 별점 선택 완료 = 자동화 완료
             await logger.updateStatus(taskId, {
               status: 'completed',
@@ -529,12 +989,14 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
             }, 120000); // 2분
             
             return; // 완료 후 종료
+          } else {
+            console.log(`[${taskId}] ⚠️ 별점 선택 실패 (UI에서 별점을 찾을 수 없음)`);
+            await logger.warn(taskId, '⚠️ 별점 선택 실패');
           }
         } catch (e) {
-          console.log(`[${taskId}] ⚠️ 별점 선택 실패`);
-          await logger.warn(taskId, '⚠️ 별점 선택 실패');
+          console.log(`[${taskId}] ⚠️ 별점 선택 처리 오류: ${e.message}`);
+          await logger.warn(taskId, `⚠️ 별점 선택 처리 오류: ${e.message}`);
         }
-      }
     } catch (e) {
       console.log(`[${taskId}] ⚠️ 입력 필드 처리 오류: ${e.message}`);
       await logger.warn(taskId, `⚠️ 입력 필드 처리 오류: ${e.message}`);

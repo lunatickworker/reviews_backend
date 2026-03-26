@@ -9,24 +9,29 @@ router.get('/', authMiddleware, async (req, res) => {
   try {
     let query = supabase
       .from('tasks')
-      .select('*, user:user_id(user_id, superior_name), store:store_id(store_name)')
+      .select('*, user:user_id(user_id, superior_name), store:store_id(id, store_name, daily_frequency, total_count)')
       .order('created_at', { ascending: false });
 
-    // agency 권한은 자신의 매장에만 접근 가능
+    // agency 권한: 자신이 소유한 매장의 작업만 조회 (store_id로 필터링)
     if (req.user.role === 'agency') {
-      // 먼저 사용자의 매장 IDs 조회
-      const { data: stores } = await supabase
+      // 1. Agency가 소유한 stores 조회
+      const { data: userStores, error: storesError } = await supabase
         .from('stores')
         .select('id')
         .eq('user_id', req.user.id);
 
-      const storeIds = stores ? stores.map(s => s.id) : [];
-      
-      if (storeIds.length === 0) {
-        return res.json([]); // 매장이 없으면 빈 배열 반환
-      }
+      if (storesError) throw storesError;
 
-      query = query.in('store_id', storeIds);
+      // 2. stores의 id 배열 생성
+      const storeIds = userStores?.map(s => s.id) || [];
+
+      // 3. 해당 stores에 연결된 tasks만 필터링
+      if (storeIds.length > 0) {
+        query = query.in('store_id', storeIds);
+      } else {
+        // store가 없으면 빈 결과 반환 (불가능한 조건)
+        query = query.eq('store_id', null);
+      }
     }
 
     const { data, error } = await query;
@@ -43,27 +48,10 @@ router.get('/', authMiddleware, async (req, res) => {
 // 새 작업 생성
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { placeName, stars, imageUploaded, status, notes, reviewStatus, imageStatus, storeId } = req.body;
+    const { placeName, stars, imageUploaded, status, notes, reviewStatus, imageStatus } = req.body;
 
     if (!placeName) {
       return res.status(400).json({ error: '매장명은 필수입니다.' });
-    }
-
-    if (!storeId) {
-      return res.status(400).json({ error: '매장을 선택하세요.' });
-    }
-
-    // agency 권한 확인: 본인의 매장인지 확인
-    if (req.user.role === 'agency') {
-      const { data: store } = await supabase
-        .from('stores')
-        .select('user_id')
-        .eq('id', storeId)
-        .single();
-
-      if (!store || store.user_id !== req.user.id) {
-        return res.status(403).json({ error: '권한이 없습니다.' });
-      }
     }
 
     const { data, error } = await supabase
@@ -79,7 +67,6 @@ router.post('/', authMiddleware, async (req, res) => {
           current_step: '대기 중',
           notes: notes || '',
           user_id: req.user.id,
-          store_id: storeId,
           created_at: new Date().toISOString(),
         },
       ])
@@ -99,25 +86,15 @@ router.put('/:id', authMiddleware, async (req, res) => {
   try {
     const { placeName, stars, imageUploaded, status, notes, reviewStatus, imageStatus, currentStep } = req.body;
 
-    // agency 권한 확인: 본인의 매장 작업인지 확인
+    // agency 권한 확인: 본인의 작업인지 확인
     if (req.user.role === 'agency') {
       const { data: task } = await supabase
         .from('tasks')
-        .select('store_id')
+        .select('user_id')
         .eq('id', req.params.id)
         .single();
 
-      if (!task) {
-        return res.status(404).json({ error: '작업을 찾을 수 없습니다.' });
-      }
-
-      const { data: store } = await supabase
-        .from('stores')
-        .select('user_id')
-        .eq('id', task.store_id)
-        .single();
-
-      if (!store || store.user_id !== req.user.id) {
+      if (!task || task.user_id !== req.user.id) {
         return res.status(403).json({ error: '권한이 없습니다.' });
       }
     }
@@ -157,25 +134,15 @@ router.put('/:id', authMiddleware, async (req, res) => {
 // 작업 삭제
 router.delete('/:id', authMiddleware, async (req, res) => {
   try {
-    // agency 권한 확인: 본인의 매장 작업인지 확인
+    // agency 권한 확인: 본인의 작업인지 확인
     if (req.user.role === 'agency') {
       const { data: task } = await supabase
         .from('tasks')
-        .select('store_id')
+        .select('user_id')
         .eq('id', req.params.id)
         .single();
 
-      if (!task) {
-        return res.status(404).json({ error: '작업을 찾을 수 없습니다.' });
-      }
-
-      const { data: store } = await supabase
-        .from('stores')
-        .select('user_id')
-        .eq('id', task.store_id)
-        .single();
-
-      if (!store || store.user_id !== req.user.id) {
+      if (!task || task.user_id !== req.user.id) {
         return res.status(403).json({ error: '권한이 없습니다.' });
       }
     }
