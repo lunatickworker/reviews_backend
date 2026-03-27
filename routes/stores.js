@@ -31,10 +31,18 @@ router.get('/', authMiddleware, async (req, res) => {
 // 매장 생성 (현재 사용자)
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { storeName, address, reviewMessage, dailyFrequency, totalCount } = req.body;
+    const { storeName, address, reviewMessage, imageUrl, dailyFrequency, totalCount } = req.body;
 
     if (!storeName) {
       return res.status(400).json({ error: '매장명을 입력하세요.' });
+    }
+
+    const dailyFreq = dailyFrequency || 1;
+    const totalCnt = totalCount || 1;
+
+    // ✓ 검증: 총 발행 횟수는 일발행 횟수 이상이어야 함
+    if (totalCnt < dailyFreq) {
+      return res.status(400).json({ error: `총 발행 횟수는 일발행 횟수(${dailyFreq}회) 이상이어야 합니다.` });
     }
 
     // 중복 체크
@@ -55,8 +63,9 @@ router.post('/', authMiddleware, async (req, res) => {
           store_name: storeName,
           address: address || null,
           review_message: reviewMessage || null,
-          daily_frequency: dailyFrequency || 1,
-          total_count: totalCount || 1,
+          image_url: imageUrl || null,
+          daily_frequency: dailyFreq,
+          total_count: totalCnt,
           user_id: req.user.id,
           created_at: new Date().toISOString(),
         },
@@ -75,10 +84,18 @@ router.post('/', authMiddleware, async (req, res) => {
 // 매장 수정 (모든 사용자)
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
-    const { storeName, address, reviewMessage, dailyFrequency, totalCount } = req.body;
+    const { storeName, address, reviewMessage, imageUrl, dailyFrequency, totalCount } = req.body;
 
     if (!storeName) {
       return res.status(400).json({ error: '매장명을 입력하세요.' });
+    }
+
+    const dailyFreq = dailyFrequency || 1;
+    const totalCnt = totalCount || 1;
+
+    // ✓ 검증: 총 발행 횟수는 일발행 횟수 이상이어야 함
+    if (totalCnt < dailyFreq) {
+      return res.status(400).json({ error: `총 발행 횟수는 일발행 횟수(${dailyFreq}회) 이상이어야 합니다.` });
     }
 
     // 매장 존재 여부만 확인
@@ -98,8 +115,9 @@ router.put('/:id', authMiddleware, async (req, res) => {
         store_name: storeName,
         address: address || null,
         review_message: reviewMessage || null,
-        daily_frequency: dailyFrequency || 1,
-        total_count: totalCount || 1,
+        image_url: imageUrl || null,
+        daily_frequency: dailyFreq,
+        total_count: totalCnt,
         updated_at: new Date().toISOString(),
       })
       .eq('id', req.params.id)
