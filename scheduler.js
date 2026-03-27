@@ -195,10 +195,15 @@ async function executeScheduledDeploys() {
       
       // 예약된 각 시간 확인
       for (const timeStr of deployTimes) {
-        // ✅ 정확히 일치하거나 1분 범위 내
-        const match = timeStr === currentTimeStr;
+        // ✅ 시간:분이 같거나, 이미 지났으면 즉시 실행
+        const [scheduledHour, scheduledMin] = timeStr.split(':').map(Number);
+        const scheduledTime = scheduledHour * 60 + scheduledMin;
+        const currentTime = now.getHours() * 60 + now.getMinutes();
         
-        if (!match) continue;
+        // 배포 시간이 도달했거나 지난 경우 (자신의 배포 시간 ± 1분 범위)
+        const isTimeReached = Math.abs(currentTime - scheduledTime) <= 1;
+        
+        if (!isTimeReached) continue;
 
         console.log(`[Scheduler] 🚀🚀🚀 ${schedule.id}: ${timeStr} 배포 시작!`);
 

@@ -4,7 +4,7 @@ const authMiddleware = require('../auth-middleware');
 
 const router = express.Router();
 
-// 모든 리뷰 조회
+// 모든 리뷰 조회 (자신의 리뷰만)
 router.get('/', authMiddleware, async (req, res) => {
   try {
     console.log('📝 Reviews GET 요청 들어옴:', {
@@ -12,10 +12,17 @@ router.get('/', authMiddleware, async (req, res) => {
       timestamp: new Date().toISOString()
     });
 
-    const { data, error } = await supabase
+    let query = supabase
       .from('reviews')
       .select('*')
       .order('created_at', { ascending: false });
+
+    // 🔐 권한: Admin이 아니면 자신의 리뷰만 조회
+    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+      query = query.eq('user_id', req.user.id);
+    }
+
+    const { data, error } = await query;
 
     console.log('📊 Supabase 쿼리 결과:', {
       rowCount: data?.length || 0,
@@ -31,13 +38,31 @@ router.get('/', authMiddleware, async (req, res) => {
   }
 });
 
-// 리뷰 업데이트 (별점, 메모 추가)
+// 리뷰 업데이트 (자신의 리뷰만)
 router.put('/update', authMiddleware, async (req, res) => {
   try {
     const { id, rating, notes, status } = req.body;
 
     if (!id) {
       return res.status(400).json({ error: 'ID는 필수입니다.' });
+    }
+
+    // 리뷰 조회 및 권한 검증
+    const { data: review, error: fetchError } = await supabase
+      .from('reviews')
+      .select('id, user_id')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !review) {
+      return res.status(404).json({ error: '리뷰를 찾을 수 없습니다.' });
+    }
+
+    // 🔐 권한 검증: Admin이 아니면 자신의 리뷰만 수정 가능
+    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+      if (review.user_id !== req.user.id) {
+        return res.status(403).json({ error: '이 리뷰를 수정할 권한이 없습니다.' });
+      }
     }
 
     const updateData = {};
@@ -100,9 +125,27 @@ router.post('/', authMiddleware, async (req, res) => {
   }
 });
 
-// 리뷰 삭제
+// 리뷰 삭제 (자신의 리뷰만)
 router.delete('/:id', authMiddleware, async (req, res) => {
   try {
+    // 리뷰 조회 및 권한 검증
+    const { data: review, error: fetchError } = await supabase
+      .from('reviews')
+      .select('id, user_id')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchError || !review) {
+      return res.status(404).json({ error: '리뷰를 찾을 수 없습니다.' });
+    }
+
+    // 🔐 권한 검증: Admin이 아니면 자신의 리뷰만 삭제 가능
+    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+      if (review.user_id !== req.user.id) {
+        return res.status(403).json({ error: '이 리뷰를 삭제할 권한이 없습니다.' });
+      }
+    }
+
     const { error } = await supabase
       .from('reviews')
       .delete()

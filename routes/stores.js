@@ -86,7 +86,7 @@ router.post('/', authMiddleware, async (req, res) => {
   }
 });
 
-// 매장 수정 (모든 사용자)
+// 매장 수정 (자신의 매장만)
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
     const { storeName, address, reviewMessage, imageUrls, dailyFrequency, totalCount } = req.body;
@@ -103,15 +103,22 @@ router.put('/:id', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: `총 발행 횟수는 일발행 횟수(${dailyFreq}회) 이상이어야 합니다.` });
     }
 
-    // 매장 존재 여부만 확인
+    // 매장 조회 및 권한 검증
     const { data: store, error: fetchError } = await supabase
       .from('stores')
-      .select('id')
+      .select('id, user_id')
       .eq('id', req.params.id)
       .single();
 
     if (fetchError || !store) {
       return res.status(404).json({ error: '매장을 찾을 수 없습니다.' });
+    }
+
+    // 🔐 권한 검증: Admin이 아니면 자신의 매장만 수정 가능
+    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+      if (store.user_id !== req.user.id) {
+        return res.status(403).json({ error: '이 매장을 수정할 권한이 없습니다.' });
+      }
     }
 
     // imageUrls 배열 검증 및 정리
@@ -142,18 +149,25 @@ router.put('/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// 매장 삭제 (모든 사용자)
+// 매장 삭제 (자신의 매장만)
 router.delete('/:id', authMiddleware, async (req, res) => {
   try {
-    // 매장 존재 여부만 확인
+    // 매장 조회 및 권한 검증
     const { data: store, error: fetchError } = await supabase
       .from('stores')
-      .select('id')
+      .select('id, user_id')
       .eq('id', req.params.id)
       .single();
 
     if (fetchError || !store) {
       return res.status(404).json({ error: '매장을 찾을 수 없습니다.' });
+    }
+
+    // 🔐 권한 검증: Admin이 아니면 자신의 매장만 삭제 가능
+    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+      if (store.user_id !== req.user.id) {
+        return res.status(403).json({ error: '이 매장을 삭제할 권한이 없습니다.' });
+      }
     }
 
     const { error } = await supabase

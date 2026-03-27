@@ -29,7 +29,7 @@ router.get('/', authMiddleware, async (req, res) => {
   }
 });
 
-// 특정 사용자 조회
+// 특정 사용자 조회 (admin - 모든 사용자, agency - 자신이 생성한 사용자만)
 router.get('/:id', authMiddleware, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -40,6 +40,13 @@ router.get('/:id', authMiddleware, async (req, res) => {
 
     if (error || !data) {
       return res.status(404).json({ error: '사용자를 찾을 수 없습니다.' });
+    }
+
+    // 🔐 권한 검증: Agency는 자신이 생성한 사용자만 조회 가능
+    if (req.user.role === 'agency') {
+      if (data.superior_name !== req.user.userId) {
+        return res.status(403).json({ error: '이 사용자의 정보를 조회할 권한이 없습니다.' });
+      }
     }
 
     res.json(data);

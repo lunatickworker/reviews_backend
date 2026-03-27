@@ -55,9 +55,14 @@ router.get('/', authMiddleware, async (req, res) => {
   }
 });
 
-// 배포 스케줄 생성 (배포 예약)
+// 배포 스케줄 생성 (배포 예약) - Admin만
 router.post('/', authMiddleware, async (req, res) => {
   try {
+    // 🔐 관리자만 배포 예약 가능
+    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+      return res.status(403).json({ error: '배포 예약은 관리자만 가능합니다.' });
+    }
+
     const { storeId, dailyFrequency, totalCount } = req.body;
 
     if (!storeId || !dailyFrequency || !totalCount) {
@@ -110,9 +115,14 @@ router.post('/', authMiddleware, async (req, res) => {
   }
 });
 
-// 배포 스케줄 취소
+// 배포 스케줄 취소 - Admin만
 router.put('/:id/cancel', authMiddleware, async (req, res) => {
   try {
+    // 🔐 관리자만 배포 취소 가능
+    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+      return res.status(403).json({ error: '배포 취소는 관리자만 가능합니다.' });
+    }
+
     const { id } = req.params;
 
     // 자신의 스케줄만 취소 가능

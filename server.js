@@ -748,169 +748,100 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
       const reviewText = notes ? notes.trim() : '좋은 경험 감사합니다!';
       let textInputSuccess = false;
       
-      // 방법 1: iframe 내 textarea 찾기
+      // server_origin.js 방식: frameLocator로 iframe 찾기
       try {
-        console.log(`[${taskId}] 🔍 방법 1: iframe 내 textarea 탐색...`);
-        const iframes = await page.$$('iframe');
-        console.log(`[${taskId}] 검색된 iframe 개수: ${iframes.length}`);
+        console.log(`[${taskId}] 🔍 frameLocator로 textarea 탐색...`);
+        const iframe = page.frameLocator('iframe[class*="goog-reviews-write-widget"]');
+        const textarea = iframe.locator('textarea[aria-label="리뷰 입력"]');
         
-        for (let i = 0; i < iframes.length; i++) {
+        const textareaCount = await textarea.count();
+        console.log(`[${taskId}] iframe 내 textarea 발견: ${textareaCount}개`);
+        
+        if (textareaCount > 0) {
+          // 1단계: textarea 클릭
           try {
-            const frameHandle = await page.$(`iframe:nth-of-type(${i + 1})`);
-            const frame = await frameHandle.contentFrame();
-            if (frame) {
-              const textareas = await frame.$$('textarea');
-              console.log(`[${taskId}] iframe ${i}: textarea 개수 = ${textareas.length}`);
-              if (textareas.length > 0) {
-                await frame.focus('textarea');
-                await frame.type('textarea', reviewText, { delay: 30 });
-                console.log(`[${taskId}] ✅ iframe ${i}의 textarea에 입력 완료`);
+            await textarea.first().click();
+            await page.waitForTimeout(300);
+            console.log(`[${taskId}] ✅ Textarea 클릭 완료`);
+          } catch (clickErr) {
+            console.log(`[${taskId}] ⚠️ Textarea 클릭 실패: ${clickErr.message}`);
+          }
+          
+          // 2단계: 포커스 설정
+          try {
+            await textarea.first().focus();
+            await page.waitForTimeout(300);
+            console.log(`[${taskId}] ✅ Textarea 포커스 완료`);
+          } catch (focusErr) {
+            console.log(`[${taskId}] ⚠️ 포커스 설정 실패: ${focusErr.message}`);
+          }
+          
+          // 3단계: fill() 방법으로 입력
+          try {
+            await textarea.first().fill(reviewText);
+            await page.waitForTimeout(300);
+            console.log(`[${taskId}] ✅ fill() 방법으로 텍스트 입력 완료`);
+            textInputSuccess = true;
+          } catch (e1) {
+            console.log(`[${taskId}] ⚠️ fill() 실패, type() 시도...`);
+            
+            // 4단계: type() 방법으로 입력
+            try {
+              await textarea.first().type(reviewText, { delay: 5 });
+              await page.waitForTimeout(300);
+              console.log(`[${taskId}] ✅ type() 방법으로 텍스트 입력 완료`);
+              textInputSuccess = true;
+            } catch (e2) {
+              console.log(`[${taskId}] ⚠️ type() 실패, JavaScript 시도...`);
+              
+              // 5단계: JavaScript로 직접 입력
+              try {
+                await page.evaluate((text) => {
+                  const ta = document.querySelector('iframe[class*="goog-reviews-write-widget"]')
+                    .contentDocument.querySelector('textarea[aria-label="리뷰 입력"]');
+                  if (ta) {
+                    ta.value = text;
+                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    ta.dispatchEvent(new Event('change', { bubbles: true }));
+                    ta.dispatchEvent(new Event('blur', { bubbles: true }));
+                    return true;
+                  }
+                  return false;
+                }, reviewText);
+                await page.waitForTimeout(300);
+                console.log(`[${taskId}] ✅ JavaScript 방법으로 텍스트 입력 완료`);
                 textInputSuccess = true;
-                break;
+              } catch (e3) {
+                console.log(`[${taskId}] ❌ JavaScript 방법도 실패: ${e3.message}`);
               }
             }
-          } catch (e) {
-            // 계속 시도
           }
         }
       } catch (e1) {
-        console.log(`[${taskId}] ⚠️ 방법 1 실패: ${e1.message}`);
+        console.log(`[${taskId}] ⚠️ frameLocator 방법 실패: ${e1.message}`);
       }
       
-      // 방법 2: 페이지 전체 textarea 탐색
+      // Fallback: 다른 selector로 탐색
       if (!textInputSuccess) {
         try {
-          console.log(`[${taskId}] 🔍 방법 2: 페이지 전체 textarea 탐색...`);
-          const textareas = await page.$$('textarea');
-          console.log(`[${taskId}] 검색된 textarea 개수: ${textareas.length}`);
-          if (textareas.length > 0) {
-            await textareas[0].focus();
-            await textareas[0].type(reviewText, { delay: 30 });
-            console.log(`[${taskId}] ✅ textarea에 입력 완료`);
+          console.log(`[${taskId}] 🔍 Fallback: 다른 selector로 탐색...`);
+          const iframe = page.frameLocator('iframe[class*="goog-reviews-write-widget"]');
+          
+          // textarea 모두 찾기
+          const allTextareas = iframe.locator('textarea');
+          const textareaCount = await allTextareas.count();
+          console.log(`[${taskId}] 모든 textarea 개수: ${textareaCount}`);
+          
+          if (textareaCount > 0) {
+            await allTextareas.first().click();
+            await page.waitForTimeout(200);
+            await allTextareas.first().fill(reviewText);
+            await page.waitForTimeout(300);
+            console.log(`[${taskId}] ✅ Fallback textarea 입력 완료`);
             textInputSuccess = true;
           }
         } catch (e2) {
-          console.log(`[${taskId}] ⚠️ 방법 2 실패: ${e2.message}`);
-        }
-      }
-      
-      // 방법 3: contenteditable 요소 탐색
-      if (!textInputSuccess) {
-        try {
-          console.log(`[${taskId}] 🔍 방법 3: contenteditable 요소 탐색...`);
-          const editables = await page.$$('[contenteditable="true"]');
-          console.log(`[${taskId}] 검색된 contenteditable 개수: ${editables.length}`);
-          if (editables.length > 0) {
-            await editables[0].focus();
-            await editables[0].type(reviewText, { delay: 30 });
-            console.log(`[${taskId}] ✅ contenteditable에 입력 완료`);
-            textInputSuccess = true;
-          }
-        } catch (e3) {
-          console.log(`[${taskId}] ⚠️ 방법 3 실패: ${e3.message}`);
-        }
-      }
-      
-      // 방법 4: JavaScript evaluate로 직접 입력
-      if (!textInputSuccess) {
-        try {
-          console.log(`[${taskId}] 🔍 방법 4: JavaScript로 직접 입력...`);
-          const result = await page.evaluate((text) => {
-            // iframe 내부 탐색
-            const iframes = document.querySelectorAll('iframe');
-            for (const iframe of iframes) {
-              try {
-                const textarea = iframe.contentDocument?.querySelector('textarea');
-                if (textarea) {
-                  textarea.value = text;
-                  textarea.dispatchEvent(new Event('input', { bubbles: true }));
-                  textarea.dispatchEvent(new Event('change', { bubbles: true }));
-                  return true;
-                }
-              } catch (e) {
-                // 계속
-              }
-            }
-            // 페이지 전체 textarea
-            const textarea = document.querySelector('textarea');
-            if (textarea) {
-              textarea.value = text;
-              textarea.dispatchEvent(new Event('input', { bubbles: true }));
-              textarea.dispatchEvent(new Event('change', { bubbles: true }));
-              return true;
-            }
-            return false;
-          }, reviewText);
-          
-          if (result) {
-            console.log(`[${taskId}] ✅ JavaScript로 입력 완료`);
-            textInputSuccess = true;
-          } else {
-            console.log(`[${taskId}] ⚠️ 방법 4 실패: textarea를 찾을 수 없음`);
-          }
-        } catch (e4) {
-          console.log(`[${taskId}] ⚠️ 방법 4 실패: ${e4.message}`);
-        }
-      }
-
-      // 🆕 방법 5: div[role="textbox"] 탐색 (Google Docs 스타일)
-      if (!textInputSuccess) {
-        try {
-          console.log(`[${taskId}] 🔍 방법 5: div[role="textbox"] 탐색...`);
-          const textboxes = await page.$$('div[role="textbox"]');
-          console.log(`[${taskId}] 검색된 textbox 개수: ${textboxes.length}`);
-          if (textboxes.length > 0) {
-            await textboxes[0].focus();
-            await textboxes[0].type(reviewText, { delay: 30 });
-            console.log(`[${taskId}] ✅ textbox에 입력 완료`);
-            textInputSuccess = true;
-          }
-        } catch (e5) {
-          console.log(`[${taskId}] ⚠️ 방법 5 실패: ${e5.message}`);
-        }
-      }
-
-      // 🆕 방법 6: input[type="text"] 탐색
-      if (!textInputSuccess) {
-        try {
-          console.log(`[${taskId}] 🔍 방법 6: input[type="text"] 탐색...`);
-          const textInputs = await page.$$('input[type="text"]');
-          console.log(`[${taskId}] 검색된 text input 개수: ${textInputs.length}`);
-          if (textInputs.length > 0) {
-            await textInputs[0].focus();
-            await textInputs[0].type(reviewText, { delay: 30 });
-            console.log(`[${taskId}] ✅ text input에 입력 완료`);
-            textInputSuccess = true;
-          }
-        } catch (e6) {
-          console.log(`[${taskId}] ⚠️ 방법 6 실패: ${e6.message}`);
-        }
-      }
-
-      // 🆕 방법 7: 모든 input 요소 탐색
-      if (!textInputSuccess) {
-        try {
-          console.log(`[${taskId}] 🔍 방법 7: 모든 input 요소 탐색...`);
-          const allInputs = await page.$$('input');
-          console.log(`[${taskId}] 검색된 input 개수: ${allInputs.length}`);
-          for (let i = 0; i < allInputs.length; i++) {
-            const inputType = await allInputs[i].evaluate(el => el.type);
-            const isVisible = await allInputs[i].evaluate(el => {
-              const rect = el.getBoundingClientRect();
-              return rect.width > 0 && rect.height > 0;
-            });
-            console.log(`[${taskId}] input[${i}]: type=${inputType}, visible=${isVisible}`);
-            
-            if (isVisible && !inputType.match(/button|submit|checkbox|radio/i)) {
-              await allInputs[i].focus();
-              await allInputs[i].type(reviewText, { delay: 30 });
-              console.log(`[${taskId}] ✅ input[${i}]에 입력 완료`);
-              textInputSuccess = true;
-              break;
-            }
-          }
-        } catch (e7) {
-          console.log(`[${taskId}] ⚠️ 방법 7 실패: ${e7.message}`);
+          console.log(`[${taskId}] ⚠️ Fallback도 실패: ${e2.message}`);
         }
       }
       
@@ -919,7 +850,7 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
         await logger.info(taskId, `✅ 리뷰 텍스트 입력 완료: "${reviewText}"`);
         await page.waitForTimeout(500);
       } else {
-        console.log(`[${taskId}] ❌ 리뷰 텍스트 입력 필드를 찾지 못함 (모든 방법 실패)`);
+        console.log(`[${taskId}] ❌ 리뷰 텍스트 입력 필드를 찾지 못함`);
         await logger.error(taskId, `❌ 입력 필드를 찾지 못함`);
       }
         
@@ -929,42 +860,92 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
         try {
           const starClicked = await page.evaluate(() => {
             const iframe = document.querySelector('iframe[class*="goog-reviews-write-widget"]');
-            if (iframe && iframe.contentDocument) {
-              // 별표 5성급 클릭
-              const ratingGroup = iframe.contentDocument.querySelector('div[aria-label="별표 평점"]');
-              if (ratingGroup) {
-                const fiveStar = ratingGroup.querySelector('div[aria-label="5성급"]');
-                if (fiveStar) {
-                  fiveStar.click();
-                  return true;
+            if (!iframe || !iframe.contentDocument) {
+              console.log('[DEBUG] iframe not found');
+              return { success: false, tried: ['iframe_not_found'] };
+            }
+            
+            const doc = iframe.contentDocument;
+            const tried = [];
+            
+            // Method 1: aria-label="별표 평점" + aria-label="5성급"
+            const ratingGroup = doc.querySelector('div[aria-label="별표 평점"]');
+            if (ratingGroup) {
+              const fiveStar = ratingGroup.querySelector('div[aria-label="5성급"]');
+              if (fiveStar) {
+                tried.push('aria-label_rating_found');
+                fiveStar.click();
+                return { success: true, method: 'aria-label_rating' };
+              }
+            }
+            tried.push('aria-label_rating_not_found');
+            
+            // Method 2: data-rating="5"
+            const ratingByData = doc.querySelector('div[data-rating="5"]');
+            if (ratingByData) {
+              tried.push('data-rating_found');
+              ratingByData.click();
+              return { success: true, method: 'data-rating' };
+            }
+            tried.push('data-rating_not_found');
+            
+            // Method 3: button with aria-label containing "5"
+            const buttons = doc.querySelectorAll('button[aria-label*="5"]');
+            for (let btn of buttons) {
+              if (btn.innerText.includes('5') || btn.getAttribute('aria-label').includes('5')) {
+                tried.push('button_aria_5_found');
+                btn.click();
+                return { success: true, method: 'button_aria_5' };
+              }
+            }
+            tried.push('button_aria_5_not_found');
+            
+            // Method 4: div with role="button" and aria-label containing "5"
+            const roleButtons = doc.querySelectorAll('div[role="button"][aria-label*="5"]');
+            for (let btn of roleButtons) {
+              tried.push('role_button_5_found');
+              btn.click();
+              return { success: true, method: 'role_button_5' };
+            }
+            tried.push('role_button_5_not_found');
+            
+            // Method 5: Look for star rating container (any element with "star" or "rating" class)
+            const allElements = doc.querySelectorAll('[class*="rating"], [class*="star"]');
+            for (let elem of allElements) {
+              if (elem.innerText && elem.innerText.includes('5')) {
+                const clickable = elem.querySelector('button, [role="button"], div[onclick]');
+                if (clickable) {
+                  tried.push('star_container_found');
+                  clickable.click();
+                  return { success: true, method: 'star_container' };
                 }
               }
-              const firstFiveStar = iframe.contentDocument.querySelector('div[data-rating="5"]');
-              if (firstFiveStar) {
-                firstFiveStar.click();
-                return true;
+            }
+            tried.push('star_container_not_found');
+            
+            // Method 6: Try all divs with onclick or role="button"
+            const clickables = doc.querySelectorAll('[role="button"], div[onclick], button');
+            for (let elem of clickables) {
+              if ((elem.getAttribute('aria-label') || elem.innerText || '').includes('5')) {
+                tried.push('generic_clickable_5_found');
+                elem.click();
+                return { success: true, method: 'generic_clickable_5' };
               }
             }
-            return false;
+            tried.push('generic_clickable_5_not_found');
+            
+            return { success: false, tried };
           });
           
-          if (starClicked) {
-            console.log(`[${taskId}] ✅ 별점 선택 완료`);
-            await logger.info(taskId, '✅ 별점 선택 완료');
+          console.log(`[${taskId}] ⭐ 선택 시도 결과:`, starClicked);
+          if (starClicked.debugInfo) {
+            console.log(`[${taskId}] ⭐ 시도한 방법들:`, starClicked.debugInfo);
+          }
+          
+          if (starClicked.success || starClicked.method) {
+            console.log(`[${taskId}] ✅ 별점 선택 완료 (방법: ${starClicked.method})`);
+            await logger.info(taskId, `✅ 별점 선택 완료 (${starClicked.method})`);
             await page.waitForTimeout(500);
-            
-            // 📸 스크린샷 촬영
-            console.log(`[${taskId}] 📸 스크린샷 촬영 중...`);
-            await logger.updateStatus(taskId, { current_step: '스크린샷 촬영' });
-            try {
-              const screenshotBuffer = await page.screenshot({ fullPage: false });
-              const dbTaskId = parseInt(taskId.replace('task_', ''));
-              await uploadScreenshot(screenshotBuffer, taskId, dbTaskId);
-              console.log(`[${taskId}] ✅ 스크린샷 완료`);
-            } catch (screenshotError) {
-              console.log(`[${taskId}] ⚠️ 스크린샷 오류: ${screenshotError.message}`);
-              await logger.warn(taskId, `⚠️ 스크린샷 오류: ${screenshotError.message}`);
-            }
             
             // 별점 선택 완료 = 자동화 완료
             await logger.updateStatus(taskId, {
@@ -990,8 +971,8 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
             
             return; // 완료 후 종료
           } else {
-            console.log(`[${taskId}] ⚠️ 별점 선택 실패 (UI에서 별점을 찾을 수 없음)`);
-            await logger.warn(taskId, '⚠️ 별점 선택 실패');
+            console.log(`[${taskId}] ❌ 별점 선택 실패 - 모든 방법 시도함:`, starClicked.tried);
+            await logger.error(taskId, `❌ 별점 선택 실패 - 시도한 방법: ${starClicked.tried.join(', ')}`);
           }
         } catch (e) {
           console.log(`[${taskId}] ⚠️ 별점 선택 처리 오류: ${e.message}`);
