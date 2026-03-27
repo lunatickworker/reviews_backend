@@ -31,7 +31,7 @@ router.get('/', authMiddleware, async (req, res) => {
 // 매장 생성 (현재 사용자)
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { storeName, address, reviewMessage, imageUrl, dailyFrequency, totalCount } = req.body;
+    const { storeName, address, reviewMessage, imageUrls, dailyFrequency, totalCount } = req.body;
 
     if (!storeName) {
       return res.status(400).json({ error: '매장명을 입력하세요.' });
@@ -56,6 +56,11 @@ router.post('/', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: '이미 등록된 매장입니다.' });
     }
 
+    // imageUrls 배열 검증 및 정리
+    const processedImageUrls = Array.isArray(imageUrls) 
+      ? imageUrls.filter(url => typeof url === 'string' && url.trim().length > 0 && url.trim().startsWith('http'))
+      : [];
+
     const { data, error } = await supabase
       .from('stores')
       .insert([
@@ -63,7 +68,7 @@ router.post('/', authMiddleware, async (req, res) => {
           store_name: storeName,
           address: address || null,
           review_message: reviewMessage || null,
-          image_url: imageUrl || null,
+          image_urls: processedImageUrls,
           daily_frequency: dailyFreq,
           total_count: totalCnt,
           user_id: req.user.id,
@@ -84,7 +89,7 @@ router.post('/', authMiddleware, async (req, res) => {
 // 매장 수정 (모든 사용자)
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
-    const { storeName, address, reviewMessage, imageUrl, dailyFrequency, totalCount } = req.body;
+    const { storeName, address, reviewMessage, imageUrls, dailyFrequency, totalCount } = req.body;
 
     if (!storeName) {
       return res.status(400).json({ error: '매장명을 입력하세요.' });
@@ -109,13 +114,18 @@ router.put('/:id', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: '매장을 찾을 수 없습니다.' });
     }
 
+    // imageUrls 배열 검증 및 정리
+    const processedImageUrls = Array.isArray(imageUrls) 
+      ? imageUrls.filter(url => typeof url === 'string' && url.trim().length > 0 && url.trim().startsWith('http'))
+      : [];
+
     const { data, error } = await supabase
       .from('stores')
       .update({
         store_name: storeName,
         address: address || null,
         review_message: reviewMessage || null,
-        image_url: imageUrl || null,
+        image_urls: processedImageUrls,
         daily_frequency: dailyFreq,
         total_count: totalCnt,
         updated_at: new Date().toISOString(),
