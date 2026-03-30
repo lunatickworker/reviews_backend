@@ -93,6 +93,7 @@ router.post('/', authMiddleware, async (req, res) => {
         user_id: req.user.id,
         daily_frequency: dailyFrequency,
         total_count: totalCount,
+        completed_count: 0,
         remaining_count: totalCount,
         status: 'active',
         start_date: today,

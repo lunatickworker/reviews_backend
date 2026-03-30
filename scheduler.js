@@ -55,9 +55,41 @@ async function executePlaywrightDeploy(storeData, schedule) {
       const remainingCount = Math.max(0, schedule.total_count - completedCount);
       
       let newStatus = schedule.status;
+      let nextBatchCreated = false;
+      
       if (remainingCount === 0) {
+        // 🎉 현재 배치 완료 → 다음 배치 자동 생성
+        console.log(`[Scheduler] 🎉🎉🎉 배치 완료!!! ID=${schedule.id}, 다음 배치 생성 중...`);
+        
+        // 다음 배치 생성
+        const nextDeployTimes = generateRandomTimes(schedule.daily_frequency);
+        const today = new Date().toISOString().split('T')[0];
+        
+        const { data: nextBatch, error: nextBatchError } = await supabase
+          .from('deploy_schedules')
+          .insert([{
+            store_id: schedule.store_id,
+            user_id: schedule.user_id,
+            daily_frequency: schedule.daily_frequency,
+            total_count: schedule.total_count,
+            completed_count: 0,
+            remaining_count: schedule.total_count,
+            status: 'active',
+            start_date: today,
+            last_deploy_date: null,
+            next_deploy_times: nextDeployTimes,
+          }])
+          .select();
+        
+        if (!nextBatchError && nextBatch) {
+          console.log(`[Scheduler] ✅ 다음 배치 생성 완료: ID=${nextBatch[0].id}, 배포 시간=${nextDeployTimes.join(', ')}`);
+          nextBatchCreated = true;
+        } else {
+          console.error(`[Scheduler] ❌ 다음 배치 생성 실패: ${nextBatchError?.message}`);
+        }
+        
+        // 현재 배치 상태를 completed로 변경
         newStatus = 'completed';
-        console.log(`[Scheduler] 🎉🎉🎉 스케줄 완료!!! ID=${schedule.id}`);
       }
 
       await supabase
@@ -66,10 +98,11 @@ async function executePlaywrightDeploy(storeData, schedule) {
           completed_count: completedCount,
           remaining_count: remainingCount,
           status: newStatus,
+          last_deploy_date: new Date().toISOString().split('T')[0],
         })
         .eq('id', schedule.id);
 
-      console.log(`[Scheduler] 📊 진행률 UPDATE: ${completedCount}/${schedule.total_count} (남음: ${remainingCount}회)`);
+      console.log(`[Scheduler] 📊 진행률 UPDATE: ${completedCount}/${schedule.total_count} (남음: ${remainingCount}회)${nextBatchCreated ? ' → 다음 배치 자동 생성됨' : ''}`);
     } else {
       console.warn(`[Scheduler] ⚠️ Playwright 배포 응답 (성공 아님):`, response.data.message);
     }
@@ -114,7 +147,7 @@ async function refreshDailySchedules() {
   try {
     console.log('[Scheduler] 📅 일일 스케줄 갱신 시작...');
 
-    // 1. 상태가 active이고 로컬 시간이 자정인 스케줄 조회
+    // 1. 상태가 active이고 완료되지 않은 스케줄 조회
     const { data: schedules, error } = await supabase
       .from('deploy_schedules')
       .select('*')
@@ -131,6 +164,12 @@ async function refreshDailySchedules() {
     const today = new Date().toISOString().split('T')[0];
 
     for (const schedule of schedules) {
+      // remaining_count가 0이면 이미 완료된 배치 (다음 배치 생성됨)
+      if (schedule.remaining_count === 0) {
+        console.log(`[Scheduler] ✅ ${schedule.id}: 배치 완료됨 (다음 배치 생성됨)`);
+        continue;
+      }
+
       const lastDeployDate = schedule.last_deploy_date;
       
       // 오늘 이미 배포했으면 스킵
@@ -148,7 +187,6 @@ async function refreshDailySchedules() {
         .from('deploy_schedules')
         .update({
           next_deploy_times: deployTimes,
-          last_deploy_date: today,
         })
         .eq('id', schedule.id);
 

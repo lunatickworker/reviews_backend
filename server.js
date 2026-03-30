@@ -157,6 +157,7 @@ app.post('/api/deploy-internal', async (req, res) => {
       notes: notes ? notes.trim() : '',
       store_id: storeId || null,
       user_id: assignedUserId,
+      completed_count: 0,
       created_at: new Date().toISOString(),
     }];
 
@@ -752,8 +753,20 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
       try {
         console.log(`[${taskId}] 🔍 frameLocator로 textarea 탐색...`);
         const iframe = page.frameLocator('iframe[class*="goog-reviews-write-widget"]');
-        const textarea = iframe.locator('textarea[aria-label="리뷰 입력"]');
         
+        // ✅ 중요: 먼저 label을 클릭해서 textarea를 활성화
+        console.log(`[${taskId}] 🖱️ Label 클릭으로 포커스 활성화...`);
+        try {
+          const label = iframe.locator('label[for="c2"]');
+          await label.click();
+          await page.waitForTimeout(500);
+          console.log(`[${taskId}] ✅ Label 클릭 완료`);
+        } catch (labelErr) {
+          console.log(`[${taskId}] ⚠️ Label 클릭 실패: ${labelErr.message}`);
+        }
+        
+        // Label 클릭 후 textarea 탐색
+        const textarea = iframe.locator('textarea[aria-label="리뷰 입력"]');
         const textareaCount = await textarea.count();
         console.log(`[${taskId}] iframe 내 textarea 발견: ${textareaCount}개`);
         
@@ -947,12 +960,66 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
             await logger.info(taskId, `✅ 별점 선택 완료 (${starClicked.method})`);
             await page.waitForTimeout(500);
             
-            // 별점 선택 완료 = 자동화 완료
-            await logger.updateStatus(taskId, {
+            // 이미지 유무에 따른 completed_count 결정 로직
+            let shouldIncrementCount = false;
+            let countReason = '';
+            
+            // 매장의 이미지 정보 확인
+            if (storeId) {
+              const { data: storeData } = await supabase
+                .from('stores')
+                .select('image_urls')
+                .eq('id', storeId)
+                .single();
+              
+              if (storeData) {
+                const hasImages = storeData.image_urls && Array.isArray(storeData.image_urls) && storeData.image_urls.length > 0;
+                
+                if (!hasImages) {
+                  // 이미지 없음: 리뷰 완료만으로 카운트 증가
+                  shouldIncrementCount = true;
+                  countReason = '이미지 없음 - 리뷰만 완료하면 카운트';
+                  console.log(`[${taskId}] ℹ️ 이 매장은 이미지 정보가 없어서 리뷰 완료로 카운트 증가`);
+                } else {
+                  // 이미지 있음: 현재 task의 image_status 확인
+                  const { data: taskData } = await supabase
+                    .from('tasks')
+                    .select('image_status')
+                    .eq('id', dbTaskId)
+                    .single();
+                  
+                  if (taskData && (taskData.image_status === 'completed' || taskData.image_status === 'ready')) {
+                    shouldIncrementCount = true;
+                    countReason = '이미지 설정됨 - 리뷰/이미지 모두 완료되어 카운트';
+                    console.log(`[${taskId}] ℹ️ 이미지도 완료됨 (${taskData.image_status}) - 카운트 증가`);
+                  } else {
+                    shouldIncrementCount = false;
+                    countReason = `이미지 설정됨 - 이미지 상태가 ${taskData?.image_status || 'pending'}이라 아직 카운트 안함`;
+                    console.log(`[${taskId}] ℹ️ 이미지가 아직 미완료 (${taskData?.image_status || 'pending'}) - 카운트 미증가`);
+                  }
+                }
+              }
+            }
+            
+            // 별점 선택 완료 = 자동화 완료, 조건에 따라 completed_count 증가
+            const updateData = {
               status: 'completed',
               review_status: 'completed',
-              current_step: '리뷰 작성 준비 완료'
-            });
+              current_step: '리뷰 작성 준비 완료',
+            };
+            
+            if (shouldIncrementCount) {
+              updateData.completed_count = 1;  // 현재발행수 증가
+            }
+            
+            await logger.updateStatus(taskId, updateData);
+            
+            if (shouldIncrementCount) {
+              await logger.info(taskId, `✅ 발행수 카운트 증가됨 (${countReason})`);
+            } else {
+              await logger.info(taskId, `⏳ 발행수 미증가 (${countReason})`);
+            }
+            
             await logger.info(taskId, '📝 브라우저에서 리뷰를 작성하고 제출해주세요');
             await logger.info(taskId, '⏱️ 2분 후 브라우저 자동 종료 예정...');
             

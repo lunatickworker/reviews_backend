@@ -66,6 +66,7 @@ router.post('/', authMiddleware, async (req, res) => {
           image_status: imageStatus || 'pending',
           current_step: '대기 중',
           notes: notes || '',
+          completed_count: 0,
           user_id: req.user.id,
           created_at: new Date().toISOString(),
         },
