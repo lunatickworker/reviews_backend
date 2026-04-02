@@ -12,11 +12,9 @@ const userRoutes = require('./routes/users');
 const storeRoutes = require('./routes/stores');
 const taskRoutes = require('./routes/tasks');
 const reviewRoutes = require('./routes/reviews');
-const scheduleRoutes = require('./routes/schedules');
 const authMiddleware = require('./auth-middleware');
 const logger = require('./logger');
 const supabase = require('./supabaseClient');
-const { initScheduler } = require('./scheduler');
 
 const app = express();
 app.use(express.json());
@@ -54,11 +52,6 @@ app.use('/api/tasks', taskRoutes);
 app.use('/api/reviews', reviewRoutes);
 const logRoutes = require('./routes/logs');
 app.use('/api/logs', logRoutes);
-app.use('/api/schedules', scheduleRoutes);
-
-// 백그라운드 스케줄러 초기화
-initScheduler();
-console.log('✅ 자동 배포 스케줄러 활성화됨');
 
 // 랜덤 계정 선택
 function getRandomAccount() {
@@ -157,7 +150,6 @@ app.post('/api/deploy-internal', async (req, res) => {
       notes: notes ? notes.trim() : '',
       store_id: storeId || null,
       user_id: assignedUserId,
-      completed_count: 0,
       created_at: new Date().toISOString(),
     }];
 
@@ -268,7 +260,7 @@ app.post('/api/deploy-internal', async (req, res) => {
     await logger.info(taskId, '📱 저장된 세션으로 브라우저 오픈');
 
     // 백그라운드에서 자동화 처리
-    backgroundTask(page, shortUrl, notes, account.email, browser, profilePath, userId, taskId);
+    backgroundTask(page, shortUrl, notes, account.email, browser, profilePath, userId, taskId, storeId);
 
     res.json({
       success: true,
@@ -495,7 +487,7 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
     console.log(`[${taskId}] ✅ work_account 저장됨: ${savedWorkAccount}`);
 
     // 백그라운드 처리 시작 (작업 ID 기록)
-    backgroundTask(page, shortUrl, notes, account.email, browser, profilePath, req.user.id, taskId);
+    backgroundTask(page, shortUrl, notes, account.email, browser, profilePath, req.user.id, taskId, storeId);
 
     res.json({
       placeName: '로딩 중...',
@@ -516,7 +508,7 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
 });
 
 // 백그라운드에서 자동화 작업 처리
-async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, userId, taskId) {
+async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, userId, taskId, storeId) {
   try {
     // 작업 상태 초기화
     await logger.updateStatus(taskId, {
@@ -1001,23 +993,19 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
               }
             }
             
-            // 별점 선택 완료 = 자동화 완료, 조건에 따라 completed_count 증가
+            // 별점 선택 완료 = 자동화 완료, 조건에 따라 진행 상태 업데이트
             const updateData = {
               status: 'completed',
               review_status: 'completed',
               current_step: '리뷰 작성 준비 완료',
             };
             
-            if (shouldIncrementCount) {
-              updateData.completed_count = 1;  // 현재발행수 증가
-            }
-            
             await logger.updateStatus(taskId, updateData);
             
             if (shouldIncrementCount) {
-              await logger.info(taskId, `✅ 발행수 카운트 증가됨 (${countReason})`);
+              await logger.info(taskId, `✅ 발행 진행: ${countReason}`);
             } else {
-              await logger.info(taskId, `⏳ 발행수 미증가 (${countReason})`);
+              await logger.info(taskId, `⏳ 발행 대기 중: ${countReason}`);
             }
             
             await logger.info(taskId, '📝 브라우저에서 리뷰를 작성하고 제출해주세요');

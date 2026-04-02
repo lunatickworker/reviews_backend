@@ -61,8 +61,8 @@ router.delete('/:taskId', authMiddleware, async (req, res) => {
   try {
     const { taskId } = req.params;
 
-    // devadmin 권한 확인
-    if (req.user.role !== 'devadmin' && req.user.role !== 'admin') {
+    // admin 권한 확인
+    if (req.user.role !== 'admin') {
       return res.status(403).json({ error: '로그 삭제 권한이 없습니다.' });
     }
 

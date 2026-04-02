@@ -66,7 +66,6 @@ router.post('/', authMiddleware, async (req, res) => {
           image_status: imageStatus || 'pending',
           current_step: '대기 중',
           notes: notes || '',
-          completed_count: 0,
           user_id: req.user.id,
           created_at: new Date().toISOString(),
         },
@@ -176,6 +175,49 @@ router.get('/user/:userId', authMiddleware, async (req, res) => {
     res.json(data);
   } catch (error) {
     console.error('작업 조회 오류:', error);
+    res.status(500).json({ error: '서버 오류가 발생했습니다.' });
+  }
+});
+
+// Task 상태 리셋 (in_progress → pending)
+router.post('/:id/reset', authMiddleware, async (req, res) => {
+  try {
+    // Task 조회 및 권한 검증
+    const { data: task, error: fetchError } = await supabase
+      .from('tasks')
+      .select('id, user_id')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchError || !task) {
+      return res.status(404).json({ error: '작업을 찾을 수 없습니다.' });
+    }
+
+    // 🔐 권한 검증: Admin이거나 본인의 작업인지 확인
+    if (req.user.role !== 'admin') {
+      if (task.user_id !== req.user.id) {
+        return res.status(403).json({ error: '권한이 없습니다.' });
+      }
+    }
+
+    // Task 상태 리셋
+    const { data, error } = await supabase
+      .from('tasks')
+      .update({
+        status: 'pending',
+        review_status: 'pending',
+        image_status: 'pending',
+        current_step: '대기 중',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', req.params.id)
+      .select();
+
+    if (error) throw error;
+
+    res.json({ message: '작업이 리셋되었습니다.', task: data[0] });
+  } catch (error) {
+    console.error('작업 리셋 오류:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
   }
 });

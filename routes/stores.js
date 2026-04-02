@@ -13,7 +13,7 @@ router.get('/', authMiddleware, async (req, res) => {
       .order('created_at', { ascending: false });
 
     // 관리자가 아니면 자신의 매장만 조회
-    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+    if (req.user.role !== 'admin') {
       query = query.eq('user_id', req.user.id);
     }
 
@@ -28,10 +28,37 @@ router.get('/', authMiddleware, async (req, res) => {
   }
 });
 
+// 특정 매장 조회
+router.get('/:id', authMiddleware, async (req, res) => {
+  try {
+    const { data: store, error } = await supabase
+      .from('stores')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+
+    if (error || !store) {
+      return res.status(404).json({ error: '매장을 찾을 수 없습니다.' });
+    }
+
+    // 권한 검증: Admin이 아니면 자신의 매장만 조회 가능
+    if (req.user.role !== 'admin') {
+      if (store.user_id !== req.user.id) {
+        return res.status(403).json({ error: '권한이 없습니다.' });
+      }
+    }
+
+    res.json(store);
+  } catch (error) {
+    console.error('매장 조회 오류:', error);
+    res.status(500).json({ error: '서버 오류가 발생했습니다.' });
+  }
+});
+
 // 매장 생성 (현재 사용자)
 router.post('/', authMiddleware, async (req, res) => {
   try {
-    const { storeName, address, reviewMessage, imageUrls, dailyFrequency, totalCount } = req.body;
+    const { storeName, address, reviewMessage, imageUrls, dailyFrequency, totalCount, draftReviews } = req.body;
 
     if (!storeName) {
       return res.status(400).json({ error: '매장명을 입력하세요.' });
@@ -45,22 +72,49 @@ router.post('/', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: `총 발행 횟수는 일발행 횟수(${dailyFreq}회) 이상이어야 합니다.` });
     }
 
-    // 중복 체크
-    const { data: existing } = await supabase
-      .from('stores')
-      .select('id')
-      .eq('user_id', req.user.id)
-      .eq('store_name', storeName);
-
-    if (existing && existing.length > 0) {
-      return res.status(400).json({ error: '이미 등록된 매장입니다.' });
-    }
-
     // imageUrls 배열 검증 및 정리
     const processedImageUrls = Array.isArray(imageUrls) 
       ? imageUrls.filter(url => typeof url === 'string' && url.trim().length > 0 && url.trim().startsWith('http'))
       : [];
 
+    // 오늘 날짜 (YYYY-MM-DD 형식)
+    const today = new Date().toISOString().split('T')[0];
+
+    // 같은 이름 + 같은 날짜의 매장들 조회
+    const { data: existingStores, error: checkError } = await supabase
+      .from('stores')
+      .select('id, total_count, created_at')
+      .eq('store_name', storeName)
+      .eq('user_id', req.user.id);
+
+    if (checkError) throw checkError;
+
+    // 오늘 등록된 같은 이름의 매장들 필터링
+    const todayStores = (existingStores || []).filter(store => {
+      const storeDate = store.created_at.split('T')[0];
+      return storeDate === today;
+    });
+
+    let finalTotalCount = totalCnt;
+
+    if (todayStores && todayStores.length > 0) {
+      // 오늘 등록된 같은 이름 매장들의 합 + 새로운 값 = 최종 total_count
+      const sumOfExisting = todayStores.reduce((sum, store) => sum + (store.total_count || 0), 0);
+      finalTotalCount = sumOfExisting + totalCnt;
+
+      // 📌 기존의 모든 같은 날짜 매장들의 total_count를 최종값으로 통일
+      for (const store of todayStores) {
+        await supabase
+          .from('stores')
+          .update({
+            total_count: finalTotalCount,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', store.id);
+      }
+    }
+
+    // 📌 새 매장 생성 (deployed_count: 0)
     const { data, error } = await supabase
       .from('stores')
       .insert([
@@ -68,9 +122,11 @@ router.post('/', authMiddleware, async (req, res) => {
           store_name: storeName,
           address: address || null,
           review_message: reviewMessage || null,
+          draft_reviews: draftReviews || '',
           image_urls: processedImageUrls,
           daily_frequency: dailyFreq,
-          total_count: totalCnt,
+          total_count: finalTotalCount,
+          deployed_count: 0,
           user_id: req.user.id,
           created_at: new Date().toISOString(),
         },
@@ -79,7 +135,11 @@ router.post('/', authMiddleware, async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ message: '매장이 등록되었습니다.', store: data[0] });
+    const message = todayStores.length > 0
+      ? `매장 "${storeName}"이 추가되었습니다. (같은 날짜 매장들 통합: 총 발행량 ${finalTotalCount})`
+      : `매장 "${storeName}"이 등록되었습니다. (총 발행량: ${finalTotalCount})`;
+
+    res.json({ message, store: data[0] });
   } catch (error) {
     console.error('매장 생성 오류:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
@@ -89,7 +149,7 @@ router.post('/', authMiddleware, async (req, res) => {
 // 매장 수정 (자신의 매장만)
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
-    const { storeName, address, reviewMessage, imageUrls, dailyFrequency, totalCount } = req.body;
+    const { storeName, address, reviewMessage, imageUrls, dailyFrequency, totalCount, draftReviews } = req.body;
 
     if (!storeName) {
       return res.status(400).json({ error: '매장명을 입력하세요.' });
@@ -106,7 +166,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
     // 매장 조회 및 권한 검증
     const { data: store, error: fetchError } = await supabase
       .from('stores')
-      .select('id, user_id')
+      .select('id, user_id, store_name, created_at, total_count, deployed_count')
       .eq('id', req.params.id)
       .single();
 
@@ -115,7 +175,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
     }
 
     // 🔐 권한 검증: Admin이 아니면 자신의 매장만 수정 가능
-    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+    if (req.user.role !== 'admin') {
       if (store.user_id !== req.user.id) {
         return res.status(403).json({ error: '이 매장을 수정할 권한이 없습니다.' });
       }
@@ -126,15 +186,140 @@ router.put('/:id', authMiddleware, async (req, res) => {
       ? imageUrls.filter(url => typeof url === 'string' && url.trim().length > 0 && url.trim().startsWith('http'))
       : [];
 
+    // 매장 등록일 (YYYY-MM-DD 형식)
+    const storeDate = store.created_at.split('T')[0];
+    const today = new Date().toISOString().split('T')[0];
+    const isToday = storeDate === today;
+
+    // 매장 이름이 변경되었는지 확인
+    if (storeName !== store.store_name) {
+      // 새로운 이름으로 같은 날짜에 등록된 매장이 있는지 확인
+      const { data: existingStores, error: checkError } = await supabase
+        .from('stores')
+        .select('id, total_count, created_at')
+        .eq('store_name', storeName)
+        .eq('user_id', req.user.id);
+
+      if (checkError) throw checkError;
+
+      if (existingStores && existingStores.length > 0) {
+        // 같은 등록일에 등록된 매장들 필터링
+        const targetStores = existingStores.filter(s => {
+          const existingDate = s.created_at.split('T')[0];
+          return existingDate === storeDate;
+        });
+
+        if (targetStores && targetStores.length > 0) {
+          // 📌 같은 날짜에 같은 새 이름의 매장들이 있으면, 모두 통합
+          const sumOfTargets = targetStores.reduce((sum, s) => sum + (s.total_count || 0), 0);
+          const mergedTotalCount = sumOfTargets + totalCnt;
+
+          // 모든 같은 날짜의 대상 매장들의 total_count를 통합값으로 업데이트
+          for (const targetStore of targetStores) {
+            await supabase
+              .from('stores')
+              .update({
+                total_count: mergedTotalCount,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', targetStore.id);
+          }
+
+          // 현재 매장도 같은 merged값으로 업데이트 후 이름 변경
+          const { data: updatedStore, error: updateError } = await supabase
+            .from('stores')
+            .update({
+              store_name: storeName,
+              total_count: mergedTotalCount,
+              deployed_count: store.deployed_count || 0,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', req.params.id)
+            .select();
+
+          if (updateError) throw updateError;
+
+          return res.json({ 
+            message: `매장 이름이 변경되었습니다. (같은 날짜 매장들 통합: 총 발행량 ${mergedTotalCount})`, 
+            store: updatedStore[0]
+          });
+        }
+      }
+    }
+
+    // 📌 현재 매장의 total_count가 변경되었고, 오늘 등록된 같은 이름 매장들이 있으면 함께 업데이트
+    if (isToday && totalCnt !== store.total_count) {
+      const { data: sameNameStores, error: checkError } = await supabase
+        .from('stores')
+        .select('id, total_count, created_at')
+        .eq('store_name', storeName)
+        .eq('user_id', req.user.id)
+        .neq('id', req.params.id);
+
+      if (checkError) throw checkError;
+
+      if (sameNameStores && sameNameStores.length > 0) {
+        // 같은 날짜의 매장들 필터링
+        const todayStores = sameNameStores.filter(s => {
+          const existingDate = s.created_at.split('T')[0];
+          return existingDate === today;
+        });
+
+        if (todayStores && todayStores.length > 0) {
+          // 모든 같은 날짜 매장들의 합 + 새 total_count = 최종값
+          const sumOfExisting = todayStores.reduce((sum, s) => sum + (s.total_count || 0), 0);
+          const newFinalTotalCount = sumOfExisting + totalCnt;
+
+          // 모든 같은 날짜 매장들의 total_count를 최종값으로 통일
+          for (const sameStore of todayStores) {
+            await supabase
+              .from('stores')
+              .update({
+                total_count: newFinalTotalCount,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', sameStore.id);
+          }
+
+          // 현재 매장도 최종값으로 업데이트
+          const { data: updatedStore, error: updateError } = await supabase
+            .from('stores')
+            .update({
+              store_name: storeName,
+              address: address || null,
+              review_message: reviewMessage || null,
+              draft_reviews: draftReviews || '',
+              image_urls: processedImageUrls,
+              daily_frequency: dailyFreq,
+              total_count: newFinalTotalCount,
+              deployed_count: store.deployed_count || 0,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', req.params.id)
+            .select();
+
+          if (updateError) throw updateError;
+
+          return res.json({ 
+            message: `매장이 수정되었습니다. (같은 날짜 매장들 통합: 총 발행량 ${newFinalTotalCount})`,
+            store: updatedStore[0] 
+          });
+        }
+      }
+    }
+
+    // 일반적인 수정 (같은 날짜 다른 매장 없음)
     const { data, error } = await supabase
       .from('stores')
       .update({
         store_name: storeName,
         address: address || null,
         review_message: reviewMessage || null,
+        draft_reviews: draftReviews || '',
         image_urls: processedImageUrls,
         daily_frequency: dailyFreq,
         total_count: totalCnt,
+        deployed_count: store.deployed_count || 0,
         updated_at: new Date().toISOString(),
       })
       .eq('id', req.params.id)
@@ -145,6 +330,55 @@ router.put('/:id', authMiddleware, async (req, res) => {
     res.json({ message: '매장이 수정되었습니다.', store: data[0] });
   } catch (error) {
     console.error('매장 수정 오류:', error);
+    res.status(500).json({ error: '서버 오류가 발생했습니다.' });
+  }
+});
+
+// 📌 매장의 배포 횟수 증가
+router.patch('/:id/deploy', authMiddleware, async (req, res) => {
+  try {
+    // 매장 조회
+    const { data: store, error: fetchError } = await supabase
+      .from('stores')
+      .select('id, user_id, deployed_count, total_count')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchError || !store) {
+      return res.status(404).json({ error: '매장을 찾을 수 없습니다.' });
+    }
+
+    // 🔐 권한 검증: Admin만 배포 가능
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: '배포 권한이 없습니다.' });
+    }
+
+    // 배포 횟수가 총발행량을 초과하지 않도록 확인
+    const currentDeployed = store.deployed_count || 0;
+    const totalCount = store.total_count || 1;
+    
+    if (currentDeployed >= totalCount) {
+      return res.status(400).json({ error: `이미 모든 발행이 완료되었습니다. (${currentDeployed}/${totalCount})` });
+    }
+
+    // deployed_count 1 증가
+    const { data: updatedStore, error: updateError } = await supabase
+      .from('stores')
+      .update({
+        deployed_count: currentDeployed + 1,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', req.params.id)
+      .select();
+
+    if (updateError) throw updateError;
+
+    res.json({ 
+      message: `배포가 완료되었습니다. (${currentDeployed + 1}/${totalCount})`,
+      store: updatedStore[0] 
+    });
+  } catch (error) {
+    console.error('배포 횟수 업데이트 오류:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
   }
 });
@@ -164,7 +398,7 @@ router.delete('/:id', authMiddleware, async (req, res) => {
     }
 
     // 🔐 권한 검증: Admin이 아니면 자신의 매장만 삭제 가능
-    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+    if (req.user.role !== 'admin') {
       if (store.user_id !== req.user.id) {
         return res.status(403).json({ error: '이 매장을 삭제할 권한이 없습니다.' });
       }
@@ -181,6 +415,229 @@ router.delete('/:id', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('매장 삭제 오류:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
+  }
+});
+
+// AI 리뷰 생성 엔드포인트 (Ollama)
+router.post('/generate-review', authMiddleware, async (req, res) => {
+  try {
+    const { guidance } = req.body;
+
+    if (!guidance || guidance.trim().length === 0) {
+      return res.status(400).json({ error: '리뷰 가이드를 입력하세요.' });
+    }
+
+    const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
+    const ollamaModel = process.env.OLLAMA_MODEL || 'neural-chat';
+
+    // 프롬프트 구성 (한글 리뷰 생성용)
+    const prompt = `다음 가이드를 바탕으로 구글맵 리뷰를 한글로 자연스럽게 작성해주세요. 150자 이내로, 존댓말로 작성하세요.
+가이드: ${guidance.trim()}
+
+리뷰: `;
+
+    console.log(`🤖 Ollama 호출: ${ollamaUrl}/api/generate (모델: ${ollamaModel})`);
+
+    // Ollama API 호출
+    const response = await fetch(`${ollamaUrl}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: ollamaModel,
+        prompt: prompt,
+        stream: false,
+        options: {
+          temperature: 0.7,
+          top_p: 0.9,
+          top_k: 40,
+          repeat_penalty: 1.1,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('Ollama API 오류:', response.status, errorText);
+      
+      // 연결 오류인 경우
+      if (response.status === 0 || !response.ok) {
+        return res.status(503).json({
+          error: 'AI 서비스 연결 실패',
+          details: 'Ollama가 실행 중이지 않습니다. 터미널에서 "ollama run neural-chat" 실행하세요.',
+        });
+      }
+      
+      return res.status(500).json({
+        error: 'AI 리뷰 생성 실패',
+        details: errorText,
+      });
+    }
+
+    const data = await response.json();
+    
+    if (!data.response) {
+      return res.status(500).json({
+        error: 'AI 응답 형식 오류',
+        details: '모델에서 응답을 받지 못했습니다.',
+      });
+    }
+
+    let reviewText = data.response.trim();
+
+    // 프롬프트 제거 (응답에 프롬프트가 포함되어 있을 경우)
+    if (reviewText.includes('리뷰:')) {
+      const parts = reviewText.split('리뷰:');
+      reviewText = parts[parts.length - 1].trim();
+    }
+
+    // 첫 번째 문장이나 150자 이내로 정리
+    const lines = reviewText.split('\n').filter(l => l.trim().length > 0);
+    const finalReview = lines.length > 0 
+      ? lines[0].substring(0, 150).trim()
+      : reviewText.substring(0, 150).trim();
+
+    console.log(`✅ AI 리뷰 생성 완료: ${finalReview.substring(0, 50)}...`);
+
+    res.json({
+      review: finalReview,
+      source: 'Ollama',
+      model: ollamaModel,
+    });
+  } catch (error) {
+    console.error('리뷰 생성 오류:', error);
+    res.status(500).json({ 
+      error: '리뷰 생성 중 오류가 발생했습니다.',
+      details: error.message 
+    });
+  }
+});
+
+// 다중 AI 리뷰 생성 엔드포인트
+router.post('/generate-reviews', authMiddleware, async (req, res) => {
+  try {
+    const { guidance, count } = req.body;
+
+    console.log('🤖 AI 리뷰 생성 요청:', { guidance, count });
+
+    if (!guidance || guidance.trim().length === 0) {
+      console.error('❌ 리뷰 가이드 없음');
+      return res.status(400).json({ error: '리뷰 가이드를 입력하세요.' });
+    }
+
+    const reviewCount = Math.min(Math.max(1, parseInt(count) || 1), 100);
+    const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
+    const ollamaModel = process.env.OLLAMA_MODEL || 'neural-chat';
+
+    console.log(`🔧 설정: URL=${ollamaUrl}, 모델=${ollamaModel}, 생성 개수=${reviewCount}`);
+
+    const generatedReviews = [];
+
+    // 순차적으로 리뷰 생성
+    for (let i = 0; i < reviewCount; i++) {
+      const prompt = `다음 가이드를 바탕으로 구글맵 리뷰를 한글로 자연스럽게 작성해주세요. 100자 이내로, 존댓말로 작성하세요.
+가이드: ${guidance.trim()}
+
+리뷰: `;
+
+      try {
+        console.log(`📤 Ollama 요청 시작 (${i + 1}/${reviewCount}): ${ollamaUrl}/api/generate`);
+        
+        // AbortController로 타임아웃 설정 (120초)
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => {
+          console.error(`⏰ 타임아웃 (${i + 1}/${reviewCount}): 120초 초과`);
+          controller.abort();
+        }, 120000);
+
+        const response = await fetch(`${ollamaUrl}/api/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: ollamaModel,
+            prompt: prompt,
+            stream: false,
+            options: {
+              temperature: 0.7,
+              top_p: 0.9,
+              top_k: 40,
+              repeat_penalty: 1.1,
+            },
+          }),
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        console.log(`📨 Ollama 응답 받음 (${i + 1}/${reviewCount}): ${response.status}`);
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error(`❌ Ollama API 오류 (${i + 1}/${reviewCount}):`, response.status, errorText);
+          continue; // 실패한 리뷰는 건너뛰고 계속 진행
+          
+        }
+
+        const data = await response.json();
+        console.log(`📦 JSON 파싱 성공 (${i + 1}/${reviewCount}), 응답 길이:`, data.response?.length);
+        
+        if (!data.response) {
+          console.warn(`⚠️ 응답이 없음 (${i + 1}/${reviewCount}), 건너뛰기`);
+          continue; // 응답이 없으면 건너뛰기
+        }
+
+        let reviewText = data.response.trim();
+        console.log(`✂️ 원본 (${i + 1}/${reviewCount}):`, reviewText.substring(0, 50));
+
+        // 프롬프트 제거
+        if (reviewText.includes('리뷰:')) {
+          const parts = reviewText.split('리뷰:');
+          reviewText = parts[parts.length - 1].trim();
+          console.log(`✂️ 정제 후 (${i + 1}/${reviewCount}):`, reviewText.substring(0, 50));
+        }
+
+        // 100자 이내로 제한
+        const lines = reviewText.split('\n').filter(l => l.trim().length > 0);
+        const finalReview = lines.length > 0 
+          ? lines[0].substring(0, 100).trim()
+          : reviewText.substring(0, 100).trim();
+
+        if (finalReview.length > 0) {
+          generatedReviews.push({
+            id: Date.now() + i,
+            text: finalReview,
+            length: finalReview.length,
+          });
+          console.log(`✅ 리뷰 저장 (${i + 1}/${reviewCount}): ${finalReview.substring(0, 30)}...`);
+        } else {
+          console.warn(`⚠️ 최종 리뷰가 빈 문자열 (${i + 1}/${reviewCount}), 건너뛰기`);
+        }
+      } catch (innerError) {
+        console.error(`리뷰 생성 실패 (${i + 1}/${reviewCount}):`, innerError);
+        continue;
+      }
+    }
+
+    if (generatedReviews.length === 0) {
+      return res.status(500).json({
+        error: 'AI 리뷰 생성 실패',
+        details: '생성된 리뷰가 없습니다.',
+      });
+    }
+
+    console.log(`✅ ${generatedReviews.length}개의 AI 리뷰 생성 완료`);
+
+    res.json({
+      reviews: generatedReviews,
+      count: generatedReviews.length,
+      source: 'Ollama',
+      model: ollamaModel,
+    });
+  } catch (error) {
+    console.error('다중 리뷰 생성 오류:', error);
+    res.status(500).json({ 
+      error: '리뷰 생성 중 오류가 발생했습니다.',
+      details: error.message 
+    });
   }
 });
 

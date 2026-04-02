@@ -18,7 +18,7 @@ router.get('/', authMiddleware, async (req, res) => {
       .order('created_at', { ascending: false });
 
     // 🔐 권한: Admin이 아니면 자신의 리뷰만 조회
-    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+    if (req.user.role !== 'admin') {
       query = query.eq('user_id', req.user.id);
     }
 
@@ -59,7 +59,7 @@ router.put('/update', authMiddleware, async (req, res) => {
     }
 
     // 🔐 권한 검증: Admin이 아니면 자신의 리뷰만 수정 가능
-    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+    if (req.user.role !== 'admin') {
       if (review.user_id !== req.user.id) {
         return res.status(403).json({ error: '이 리뷰를 수정할 권한이 없습니다.' });
       }
@@ -140,7 +140,7 @@ router.delete('/:id', authMiddleware, async (req, res) => {
     }
 
     // 🔐 권한 검증: Admin이 아니면 자신의 리뷰만 삭제 가능
-    if (req.user.role !== 'admin' && req.user.role !== 'devadmin') {
+    if (req.user.role !== 'admin') {
       if (review.user_id !== req.user.id) {
         return res.status(403).json({ error: '이 리뷰를 삭제할 권한이 없습니다.' });
       }
