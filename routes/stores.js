@@ -211,7 +211,8 @@ router.post('/', authMiddleware, async (req, res) => {
             }
 
             const safeName = `${safeNameBase}.jpg`;
-            path = `stores/${req.params.id}/${safeName}`;
+            const todayFolder = new Date().toISOString().split('T')[0];
+            path = `stores/${todayFolder}/${safeName}`;
 
             const { data: uploadData, error: uploadError } = await supabase.storage
               .from(bucket)
@@ -232,7 +233,8 @@ router.post('/', authMiddleware, async (req, res) => {
             }
 
             const safeName = `${safeNameBase}`;
-            path = `stores/${req.params.id}/${safeName}`;
+            const todayFolder = new Date().toISOString().split('T')[0];
+            path = `stores/${todayFolder}/${safeName}`;
             contentType = file.mimetype || 'application/octet-stream';
 
             const { data: uploadData, error: uploadError } = await supabase.storage
