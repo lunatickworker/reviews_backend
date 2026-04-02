@@ -3,6 +3,14 @@ const supabase = require('../supabaseClient');
 const authMiddleware = require('../auth-middleware');
 
 const router = express.Router();
+const multer = require('multer');
+let sharp = null;
+try {
+  sharp = require('sharp');
+} catch (err) {
+  console.warn('⚠️ sharp 모듈을 불러올 수 없습니다. 이미지 리사이즈 기능은 비활성화됩니다. 설치하면 자동으로 활성화됩니다.');
+}
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // allow larger original, we'll resize server-side if sharp available
 
 // 매장 조회 (관리자: 모든 매장, 일반 사용자: 자신의 매장)
 router.get('/', authMiddleware, async (req, res) => {
@@ -145,6 +153,123 @@ router.post('/', authMiddleware, async (req, res) => {
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
   }
 });
+
+  // 이미지 업로드: POST /api/stores/:id/images (서버에서 리사이즈 후 업로드)
+  router.post('/:id/images', authMiddleware, upload.array('images', 2), async (req, res) => {
+    try {
+      const bucket = process.env.SUPABASE_STORAGE_BUCKET || 'google';
+
+      // 권한 검증: Admin 아니면 자신의 매장만 가능
+      const { data: store, error: fetchError } = await supabase
+        .from('stores')
+        .select('id, user_id, image_urls')
+        .eq('id', req.params.id)
+        .single();
+
+      if (fetchError || !store) return res.status(404).json({ error: '매장을 찾을 수 없습니다.' });
+      if (req.user.role !== 'admin' && store.user_id !== req.user.id) {
+        return res.status(403).json({ error: '권한이 없습니다.' });
+      }
+
+      const files = req.files || [];
+      if (files.length === 0) return res.status(400).json({ error: '업로드할 이미지가 없습니다.' });
+
+      const uploadedUrls = [];
+
+      for (const file of files) {
+        try {
+          let path;
+          let contentType;
+          let safeNameBase = `${Date.now()}_${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+
+          if (sharp) {
+            // 서버사이드 리사이즈/압축: JPEG 변환, 최대 너비 1920px, 반복 압축으로 2MB 이하 목표
+            let quality = 80;
+            let processed = await sharp(file.buffer)
+              .rotate()
+              .resize({ width: 1920, withoutEnlargement: true })
+              .jpeg({ quality })
+              .toBuffer();
+
+            while (processed.length > 2 * 1024 * 1024 && quality >= 50) {
+              quality -= 10;
+              processed = await sharp(file.buffer)
+                .rotate()
+                .resize({ width: Math.round(1920 * (quality / 80)), withoutEnlargement: true })
+                .jpeg({ quality })
+                .toBuffer();
+            }
+
+            if (processed.length > 2 * 1024 * 1024) {
+              console.warn('이미지 처리 후에도 2MB 초과:', file.originalname, processed.length);
+              // 더 강하게 리사이즈하여 올리기 (작게)
+              processed = await sharp(file.buffer)
+                .rotate()
+                .resize({ width: 1024, withoutEnlargement: true })
+                .jpeg({ quality: 50 })
+                .toBuffer();
+            }
+
+            const safeName = `${safeNameBase}.jpg`;
+            path = `stores/${req.params.id}/${safeName}`;
+
+            const { data: uploadData, error: uploadError } = await supabase.storage
+              .from(bucket)
+              .upload(path, processed, { contentType: 'image/jpeg' });
+
+            if (uploadError) {
+              console.error('Storage upload error:', uploadError);
+              continue;
+            }
+
+            const { data: publicData } = await supabase.storage.from(bucket).getPublicUrl(path);
+            uploadedUrls.push(publicData?.publicUrl || null);
+          } else {
+            // sharp 미설치인 경우: 원본 업로드(단, 파일 크기 제한 검사)
+            if (file.size > 2 * 1024 * 1024) {
+              console.warn('sharp 미설치, 파일 크기가 2MB 초과하여 업로드를 건너뜁니다:', file.originalname, file.size);
+              continue;
+            }
+
+            const safeName = `${safeNameBase}`;
+            path = `stores/${req.params.id}/${safeName}`;
+            contentType = file.mimetype || 'application/octet-stream';
+
+            const { data: uploadData, error: uploadError } = await supabase.storage
+              .from(bucket)
+              .upload(path, file.buffer, { contentType });
+
+            if (uploadError) {
+              console.error('Storage upload error:', uploadError);
+              continue;
+            }
+
+            const { data: publicData } = await supabase.storage.from(bucket).getPublicUrl(path);
+            uploadedUrls.push(publicData?.publicUrl || null);
+          }
+        } catch (innerErr) {
+          console.error('이미지 처리/업로드 실패:', innerErr);
+        }
+      }
+
+      // Update store record image_urls by appending new urls
+      const existingUrls = (store.image_urls && Array.isArray(store.image_urls)) ? store.image_urls : [];
+      const finalUrls = existingUrls.concat(uploadedUrls.filter(Boolean));
+
+      const { data: updatedStore, error: updateError } = await supabase
+        .from('stores')
+        .update({ image_urls: finalUrls, updated_at: new Date().toISOString() })
+        .eq('id', req.params.id)
+        .select();
+
+      if (updateError) throw updateError;
+
+      res.json({ message: '이미지 업로드 완료', urls: uploadedUrls, store: updatedStore[0] });
+    } catch (error) {
+      console.error('이미지 업로드 오류:', error);
+      res.status(500).json({ error: '이미지 업로드 중 오류가 발생했습니다.' });
+    }
+  });
 
 // 매장 수정 (자신의 매장만)
 router.put('/:id', authMiddleware, async (req, res) => {
@@ -331,6 +456,62 @@ router.put('/:id', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('매장 수정 오류:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
+  }
+});
+
+// 이미지 삭제: DELETE /api/stores/:id/images  body: { url }
+router.delete('/:id/images', authMiddleware, async (req, res) => {
+  try {
+    const { url } = req.body;
+    const bucket = process.env.SUPABASE_STORAGE_BUCKET || 'google';
+
+    if (!url) return res.status(400).json({ error: '삭제할 이미지 URL을 제공하세요.' });
+
+    // 매장 조회 및 권한 확인
+    const { data: store, error: fetchError } = await supabase
+      .from('stores')
+      .select('id, user_id, image_urls')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchError || !store) return res.status(404).json({ error: '매장을 찾을 수 없습니다.' });
+    if (req.user.role !== 'admin' && store.user_id !== req.user.id) {
+      return res.status(403).json({ error: '권한이 없습니다.' });
+    }
+
+    // public url에서 path 추출 (bucket 뒤부분)
+    // 공용 URL 예: https://<project>.supabase.co/storage/v1/object/public/<bucket>/stores/123/name.jpg
+    const marker = `/storage/v1/object/public/${bucket}/`;
+    const idx = url.indexOf(marker);
+    if (idx === -1) {
+      // try alternative: if url contains bucket directly
+      const alt = `/${bucket}/`;
+      const idx2 = url.indexOf(alt);
+      if (idx2 === -1) return res.status(400).json({ error: '이미지 경로를 파싱할 수 없습니다.' });
+      const path = url.substring(idx2 + alt.length);
+      // remove object
+      const { error: removeErr } = await supabase.storage.from(bucket).remove([path]);
+      if (removeErr) console.warn('Supabase remove warning:', removeErr);
+    } else {
+      const path = url.substring(idx + marker.length);
+      const { error: removeErr } = await supabase.storage.from(bucket).remove([path]);
+      if (removeErr) console.warn('Supabase remove warning:', removeErr);
+    }
+
+    // DB에서 URL 제거
+    const newUrls = (store.image_urls || []).filter(u => u !== url);
+    const { data: updatedStore, error: updateError } = await supabase
+      .from('stores')
+      .update({ image_urls: newUrls, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .select();
+
+    if (updateError) throw updateError;
+
+    res.json({ message: '이미지 삭제 완료', store: updatedStore[0] });
+  } catch (error) {
+    console.error('이미지 삭제 오류:', error);
+    res.status(500).json({ error: '이미지 삭제 중 오류가 발생했습니다.' });
   }
 });
 
