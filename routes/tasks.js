@@ -84,7 +84,7 @@ router.post('/', authMiddleware, async (req, res) => {
 // 작업 업데이트
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
-    const { placeName, stars, imageUploaded, status, notes, reviewStatus, imageStatus, currentStep } = req.body;
+    const { placeName, stars, imageUploaded, status, notes, reviewStatus, imageStatus, currentStep, workAccount } = req.body;
 
     // agency 권한 확인: 본인의 작업인지 확인
     if (req.user.role === 'agency') {
@@ -108,6 +108,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
     if (reviewStatus !== undefined) updateData.review_status = reviewStatus;
     if (imageStatus !== undefined) updateData.image_status = imageStatus;
     if (currentStep !== undefined) updateData.current_step = currentStep;
+    if (workAccount !== undefined) updateData.work_account = workAccount;
     updateData.updated_at = new Date().toISOString();
 
     console.log('📝 작업 업데이트:', {

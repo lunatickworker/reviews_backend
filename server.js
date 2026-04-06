@@ -177,14 +177,18 @@ app.post('/api/deploy-internal', async (req, res) => {
     
     // 랜덤 Google 계정 선택
     const account = getRandomAccount();
-    const workAccount = account.email.split('@')[0];
     
-    await supabase
-      .from('tasks')
-      .update({ work_account: workAccount })
-      .eq('id', dbTaskId);
+    // 작업 계정은 호출 측에서 전달된 값을 사용하고, 없으면 미지정으로 유지
+    const explicitWorkAccount = req.body.workAccount?.trim() || null;
+    if (explicitWorkAccount) {
+      await supabase
+        .from('tasks')
+        .update({ work_account: explicitWorkAccount })
+        .eq('id', dbTaskId);
+      await logger.info(taskId, `작업 계정 설정(명시): ${explicitWorkAccount}`);
+    }
 
-    await logger.info(taskId, `사용 계정: ${account.email}`);
+    await logger.info(taskId, `사용 계정 (로그인용): ${account.email}`);
 
     // 프로필 디렉토리 설정
     const profileDir = path.join(
@@ -283,7 +287,7 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
     return res.status(403).json({ error: 'admin 권한이 필요합니다.' });
   }
 
-  const { shortUrl, notes, storeId, totalCount = 1 } = req.body;
+  const { shortUrl, notes, storeId, totalCount = 1, workAccount: explicitWorkAccount = '' } = req.body;
   if (!shortUrl) return res.status(400).json({ error: 'shortUrl is required' });
 
   let browser;
@@ -316,6 +320,7 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
         notes: notes ? notes.trim() : '',
         store_id: storeId || null,  // ✅ 매장 ID 저장
         user_id: req.user.id,
+        work_account: explicitWorkAccount?.trim() || null,
         created_at: new Date().toISOString(),
       });
     }
@@ -350,16 +355,9 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
       await logger.info(taskId, `📝 메모: ${notes}`);
     }
 
-    // 랜덤 계정 선택
+    // 랜덤 계정 선택 (자동화 실행용)
     const account = getRandomAccount();
-    const workAccount = account.email.split('@')[0]; // 이메일에서 @ 앞부분 추출
-    await logger.info(taskId, `사용 계정: ${account.email}`);
-    
-    // 첫 번째 task에만 work_account 업데이트
-    await supabase
-      .from('tasks')
-      .update({ work_account: workAccount })
-      .eq('id', dbTaskId);
+    await logger.info(taskId, `사용 계정 (로그인용): ${account.email}`);
 
     // 계정별 저장된 프로필 디렉토리 (첫 로그인만 수동, 이후는 자동)
     const profileDir = path.join(
@@ -483,7 +481,7 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
       .eq('id', dbTaskId)
       .single();
 
-    const savedWorkAccount = updatedTask?.work_account || workAccount;
+    const savedWorkAccount = updatedTask?.work_account || explicitWorkAccount;
     console.log(`[${taskId}] ✅ work_account 저장됨: ${savedWorkAccount}`);
 
     // 백그라운드 처리 시작 (작업 ID 기록)
@@ -721,9 +719,97 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
         }
       }
 
-      if (!writeReviewClicked) {
-        console.log(`[${taskId}] ⚠️ 리뷰 작성 버튼을 찾지 못함`);
-        await logger.warn(taskId, '⚠️ 리뷰 작성 버튼을 찾지 못함');
+      if (writeReviewClicked) {
+        // ✅ 리뷰 모달 열린 후, .Af21Ie 요소 (작업 계정) 파싱
+        console.log(`[${taskId}] 🔍 작업 계정 파싱 중...`);
+        await logger.info(taskId, '🔍 작업 계정 파싱 중...');
+        
+        // 모달이 완전히 로드될 때까지 대기
+        await page.waitForTimeout(3000);
+        
+        let workAccountValue = null;
+        let retries = 0;
+        const maxRetries = 5;
+        
+        while (!workAccountValue && retries < maxRetries) {
+          try {
+            workAccountValue = await page.evaluate(() => {
+              // iframe 포함해서 모든 document 검사
+              function findInFrames(selector) {
+                const search = (doc) => {
+                  const el = doc.querySelector(selector);
+                  if (el) return el;
+                  const iframes = Array.from(doc.querySelectorAll('iframe'));
+                  for (const iframe of iframes) {
+                    try {
+                      const childDoc = iframe.contentDocument || iframe.contentWindow?.document;
+                      if (!childDoc) continue;
+                      const found = search(childDoc);
+                      if (found) return found;
+                    } catch (e) {
+                      continue;
+                    }
+                  }
+                  return null;
+                };
+                return search(document);
+              }
+              
+              const el = findInFrames('.Af21Ie');
+              return el?.textContent?.trim() || null;
+            });
+            
+            if (!workAccountValue) {
+              console.log(`[${taskId}] ⏳ 작업 계정 대기중... (시도 ${retries + 1}/${maxRetries})`);
+              await page.waitForTimeout(1000);
+              retries++;
+            }
+          } catch (parseError) {
+            console.log(`[${taskId}] ⚠️ 파싱 시도 오류: ${parseError.message}`);
+            await page.waitForTimeout(1000);
+            retries++;
+          }
+        }
+        
+        if (workAccountValue) {
+          console.log(`[${taskId}] ✅ 작업 계정 파싱 성공: ${workAccountValue}`);
+          await logger.info(taskId, `✅ 작업 계정 파싱 성공: ${workAccountValue}`);
+          
+          // localStorage에 저장
+          await page.evaluate((account) => {
+            try {
+              localStorage.setItem('detectedWorkAccount', account);
+              console.log('✅ localStorage에 저장됨:', account);
+            } catch (e) {
+              console.log('⚠️ localStorage 저장 실패:', e);
+            }
+          }, workAccountValue);
+          
+          // ✅ DB tasks.work_account 업데이트
+          try {
+            // taskId에서 DB id 추출 ("task_96" → 96)
+            const dbId = parseInt(taskId.split('_')[1]);
+            
+            const { error: updateError } = await supabase
+              .from('tasks')
+              .update({ work_account: workAccountValue })
+              .eq('id', dbId);
+            
+            if (updateError) {
+              console.log(`[${taskId}] ⚠️ DB 업데이트 오류: ${updateError.message}`);
+              await logger.warn(taskId, `⚠️ DB work_account 업데이트 실패: ${updateError.message}`);
+            } else {
+              console.log(`[${taskId}] 💾 DB work_account 업데이트 완료: ${workAccountValue}`);
+              await logger.info(taskId, `💾 DB work_account 업데이트 완료: ${workAccountValue}`);
+            }
+          } catch (dbError) {
+            console.log(`[${taskId}] ⚠️ DB 업데이트 중 에러: ${dbError.message}`);
+            await logger.warn(taskId, `⚠️ DB 업데이트 중 에러: ${dbError.message}`);
+          }
+        } else {
+          console.log(`[${taskId}] ⚠️ 작업 계정을 찾지 못함 (.Af21Ie) - ${maxRetries}회 재시도 후`);
+          await logger.warn(taskId, '⚠️ 작업 계정을 찾지 못함 - 재시도 완료');
+        }
       }
     } catch (e) {
       console.log(`[${taskId}] ⚠️ 리뷰 작성 버튼 오류: ${e.message}`);
@@ -1014,6 +1100,105 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
             // 2분 후 자동 종료
             setTimeout(async () => {
               try {
+                // ✅ 링크 추출: 매장 페이지 재방문
+                console.log(`[${taskId}] 🔗 리뷰 공유 링크 추출 시작...`);
+                await logger.info(taskId, '🔗 리뷰 공유 링크 추출 시작...');
+                
+                try {
+                  // 매장 페이지로 이동
+                  await page.goto(shortUrl, { waitUntil: 'networkidle', timeout: 30000 });
+                  await page.waitForTimeout(2000);
+                  
+                  // 작업 계정 파싱
+                  const workAccountForLink = await page.evaluate(() => {
+                    function findInFrames(selector) {
+                      const search = (doc) => {
+                        const el = doc.querySelector(selector);
+                        if (el) return el;
+                        const iframes = Array.from(doc.querySelectorAll('iframe'));
+                        for (const iframe of iframes) {
+                          try {
+                            const childDoc = iframe.contentDocument || iframe.contentWindow?.document;
+                            if (!childDoc) continue;
+                            const found = search(childDoc);
+                            if (found) return found;
+                          } catch (e) {
+                            continue;
+                          }
+                        }
+                        return null;
+                      };
+                      return search(document);
+                    }
+                    
+                    const el = findInFrames('.Af21Ie');
+                    return el?.textContent?.trim() || null;
+                  });
+                  
+                  if (!workAccountForLink) {
+                    console.log(`[${taskId}] ⚠️ 작업 계정 파싱 실패 (링크 추출 중)`)
+                    await logger.warn(taskId, '⚠️ 작업 계정 파싱 실패 (링크 추출 중)');
+                  } else {
+                    console.log(`[${taskId}] ✅ 작업 계정 파싱: ${workAccountForLink}`);
+                  }
+                  
+                  // "{workAccount}님의 리뷰 공유" 버튼 찾기
+                  const shareButtonXPath = `//*[contains(text(), '님의 리뷰 공유')]`;
+                  const shareButton = await page.locator(`//button | //div[@role='button']`).filter({ has: page.locator(`//*[contains(text(), '님의 리뷰 공유')]`) }).first();
+                  
+                  if (shareButton) {
+                    await shareButton.click();
+                    await page.waitForTimeout(1000);
+                    
+                    // input 필드에서 링크 추출 (여러 selector 시도)
+                    const linkInputSelectors = [
+                      'input[readonly][value*="maps.app.goo"]',
+                      'input[readonly]',
+                      'input[type="text"][readonly]',
+                      'input[value*="maps"]'
+                    ];
+                    
+                    let shareLink = null;
+                    for (const selector of linkInputSelectors) {
+                      const inputEl = await page.$(selector);
+                      if (inputEl) {
+                        shareLink = await inputEl.inputValue ? await inputEl.inputValue() : await page.getAttribute(selector, 'value');
+                        if (shareLink && shareLink.includes('maps')) break;
+                      }
+                    }
+                    
+                    if (shareLink && shareLink.includes('maps')) {
+                      console.log(`[${taskId}] ✅ 링크 추출 성공: ${shareLink}`);
+                      await logger.info(taskId, `✅ 링크 추출 성공`);
+                      
+                      // DB 업데이트
+                      const dbId = parseInt(taskId.split('_')[1]);
+                      const { error: linkError } = await supabase
+                        .from('tasks')
+                        .update({ review_share_link: shareLink })
+                        .eq('id', dbId);
+                      
+                      if (linkError) {
+                        console.log(`[${taskId}] ⚠️ DB 링크 저장 오류: ${linkError.message}`);
+                        await logger.warn(taskId, `⚠️ DB 링크 저장 오류: ${linkError.message}`);
+                      } else {
+                        console.log(`[${taskId}] 💾 DB 링크 업데이트 완료`);
+                        await logger.info(taskId, '💾 DB 링크 업데이트 완료');
+                      }
+                    } else {
+                      console.log(`[${taskId}] ⚠️ 링크 입력 필드를 찾지 못함`);
+                      await logger.warn(taskId, '⚠️ 링크 입력 필드를 찾지 못함');
+                    }
+                  } else {
+                    console.log(`[${taskId}] ⚠️ "님의 리뷰 공유" 버튼을 찾지 못함`);
+                    await logger.warn(taskId, '⚠️ "님의 리뷰 공유" 버튼을 찾지 못함');
+                  }
+                } catch (linkExtractError) {
+                  console.log(`[${taskId}] ⚠️ 링크 추출 오류: ${linkExtractError.message}`);
+                  await logger.warn(taskId, `⚠️ 링크 추출 오류: ${linkExtractError.message}`);
+                }
+                
+                // 브라우저 종료
                 await browser.close();
                 console.log(`[${taskId}] 🔒 브라우저 자동 종료됨 (프로필 저장됨)\n`);
                 await logger.info(taskId, '🔒 브라우저 자동 종료됨 (프로필 저장됨)');
@@ -1053,6 +1238,162 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
     }
   }
 }
+
+// ✅ 링크 자동 추출 (Playwright 자동화)
+app.post('/api/extract-review-link', authMiddleware, async (req, res) => {
+  const { taskId } = req.body;
+  
+  if (!taskId) {
+    return res.status(400).json({ error: 'taskId is required' });
+  }
+  
+  const dbId = typeof taskId === 'string' && taskId.startsWith('task_') 
+    ? parseInt(taskId.split('_')[1]) 
+    : taskId;
+  
+  const taskIdStr = `task_${dbId}`;
+  let browser;
+  
+  try {
+    // Task & Store 조회
+    const { data: task } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('id', dbId)
+      .single();
+    
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+    
+    const { data: store } = await supabase
+      .from('stores')
+      .select('address')
+      .eq('id', task.store_id)
+      .single();
+    
+    if (!store?.address) return res.status(404).json({ error: 'Store address not found' });
+    
+    const workAccount = task.work_account.trim();
+    console.log(`🔗 [${taskIdStr}] 시작: ${workAccount} - ${store.address}`);
+    
+    // Playwright 시작
+    browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'
+    });
+    const page = await context.newPage();
+    
+    // 1. 매장 페이지 열기
+    await page.goto(store.address, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(3000);
+    
+    // 2. 리뷰 섹션 활성화 후 HTML 저장
+    const fs = require('fs');
+    const path = require('path');
+    
+    // 1. Reviews 버튼 클릭 (리뷰 탭 활성화)
+    console.log(`[${taskIdStr}] 🔍 Reviews 버튼 찾기...`);
+    try {
+      const reviewsBtn = await page.getByRole('button', { name: 'Reviews' });
+      const count = await reviewsBtn.count();
+      if (count > 0) {
+        console.log(`[${taskIdStr}] ✅ Reviews 버튼 발견, 클릭...`);
+        await reviewsBtn.click();
+        await page.waitForTimeout(2000);
+      }
+    } catch (e) {
+      console.log(`[${taskIdStr}] ⚠️ Reviews 버튼 클릭 실패: ${e.message}`);
+    }
+    
+    // 2. 추가 스크롤
+    console.log(`[${taskIdStr}] ⏳ 리뷰 로딩 대기...`);
+    for (let i = 0; i < 10; i++) {
+      await page.mouse.wheel(0, 500);
+      await page.waitForTimeout(300);
+    }
+    await page.waitForTimeout(2000);
+    
+    // 3. HTML 저장
+    const frames = await page.frames();
+    for (const frame of frames) {
+      try {
+        const htmlContent = await frame.content();
+        const debugPath = path.join(__dirname, `debug_${taskIdStr}.html`);
+        fs.writeFileSync(debugPath, htmlContent, 'utf-8');
+        console.log(`[${taskIdStr}] 📄 HTML 저장: ${debugPath}`);
+        
+        // 페이지 분석
+        const result = await frame.evaluate(() => {
+          const hasMama1 = document.body.textContent.includes('mama1');
+          const shareButtons = document.querySelectorAll('button[aria-label*="Share"]').length;
+          return { hasMama1, shareButtons };
+        });
+        
+        console.log(`[${taskIdStr}] 📊 분석:`, result);
+      } catch (e) {
+        console.log(`[${taskIdStr}] ❌ 오류: ${e.message}`);
+      }
+    }
+    
+    throw new Error(`HTML 저장 완료. 파일 확인!`);
+    
+    // 3. Input에서 링크 추출
+    console.log(`[${taskIdStr}] 🔗 링크 추출...`);
+    
+    let shareLink = null;
+    
+    for (const frame of frames) {
+      try {
+        const result = await frame.evaluate(() => {
+          // input[readonly]에서 링크 추출
+          const linkInput = document.querySelector('input[readonly]');
+          if (linkInput) {
+            const link = linkInput.value;
+            console.log(`✅ 링크 발견: "${link?.substring(0, 50)}"`);
+            return link;
+          }
+          
+          console.log(`❌ input[readonly]을 찾지 못함`);
+          return null;
+        });
+        
+        if (result && result.includes('maps')) {
+          shareLink = result;
+          console.log(`[${taskIdStr}] ✅ 링크 추출: ${shareLink}`);
+          break;
+        }
+      } catch (e) {
+        console.log(`[${taskIdStr}] ⚠️ Frame 오류: ${e.message}`);
+      }
+    }
+    
+    if (!shareLink) {
+      await browser.close();
+      return res.status(400).json({ error: '링크를 찾지 못함' });
+    }
+    
+    // 4. DB 저장
+    const { error: updateError } = await supabase
+      .from('tasks')
+      .update({ review_share_link: shareLink })
+      .eq('id', dbId);
+    
+    await browser.close();
+    
+    if (updateError) {
+      return res.status(500).json({ error: 'DB update failed' });
+    }
+    
+    console.log(`✅ [${taskIdStr}] 완료: ${shareLink}`);
+    res.json({ success: true, review_share_link: shareLink });
+    
+  } catch (error) {
+    if (browser) await browser.close();
+    console.error(`❌ [${taskIdStr}] ${error.message}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 수동 링크 저장
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
