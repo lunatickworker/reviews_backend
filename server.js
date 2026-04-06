@@ -4,6 +4,7 @@ const { chromium } = require('playwright');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const { EventEmitter } = require('events');
 require('dotenv').config();
 
 // 라우트 import
@@ -31,12 +32,8 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
-// .env에서 Google 계정 로드
-const googleAccounts = JSON.parse(process.env.GOOGLE_ACCOUNTS || '[]');
-
-if (googleAccounts.length === 0) {
-  console.warn('⚠️ Warning: GOOGLE_ACCOUNTS not configured in .env');
-}
+// ✅ 프로세스 진행 신호 대기 (taskId → Promise)
+const processWaiters = new Map();
 
 // 사용자 데이터 디렉토리 (쿠키/세션 저장)
 const userDataDir = path.join(__dirname, '.auth');
@@ -52,21 +49,8 @@ app.use('/api/tasks', taskRoutes);
 app.use('/api/reviews', reviewRoutes);
 const logRoutes = require('./routes/logs');
 app.use('/api/logs', logRoutes);
-
-// 랜덤 계정 선택
-function getRandomAccount() {
-  if (googleAccounts.length === 0) {
-    throw new Error('No Google accounts configured');
-  }
-  const randomIndex = Math.floor(Math.random() * googleAccounts.length);
-  return googleAccounts[randomIndex];
-}
-
-// 계정별 프로필 디렉토리
-function getProfilePath(email) {
-  const emailHash = Buffer.from(email).toString('base64').replace(/\//g, '_');
-  return path.join(userDataDir, `profile_${emailHash}`);
-}
+const accountRoutes = require('./routes/accounts');
+app.use('/api/accounts', accountRoutes);
 
 // Supabase Storage에 스크린샷 업로드
 async function uploadScreenshot(screenshotBuffer, taskId, dbTaskId) {
@@ -294,15 +278,36 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
   try {
     // 1. store 정보 조회 (storeId가 있으면)
     let placeName = '로딩 중...';
+    let storeTotalCount = totalCount;
+    
     if (storeId) {
       const { data: storeData } = await supabase
         .from('stores')
-        .select('store_name')
+        .select('store_name, total_count')
         .eq('id', storeId)
         .single();
       
       if (storeData && storeData.store_name) {
         placeName = storeData.store_name;
+      }
+      
+      if (storeData && storeData.total_count) {
+        storeTotalCount = storeData.total_count;
+      }
+      
+      // ✅ 현재발행수 확인
+      const { data: completedTasks } = await supabase
+        .from('tasks')
+        .select('completed_count')
+        .eq('store_id', storeId);
+      
+      const currentCount = (completedTasks || []).reduce((sum, task) => sum + (task.completed_count || 0), 0);
+      
+      // ✅ 총발행 초과 체크
+      if (currentCount >= storeTotalCount) {
+        return res.status(400).json({ 
+          error: `❌ 이미 총발행수(${storeTotalCount})에 도달했습니다.\n현재발행수: ${currentCount} / ${storeTotalCount}`
+        });
       }
     }
     
@@ -355,36 +360,15 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
       await logger.info(taskId, `📝 메모: ${notes}`);
     }
 
-    // 랜덤 계정 선택 (자동화 실행용)
-    const account = getRandomAccount();
-    await logger.info(taskId, `사용 계정 (로그인용): ${account.email}`);
+    // Chrome 실행 (깨끗한 상태 - 저장된 프로필 사용 안함)
+    console.log(`${'='.repeat(60)}`);
+    console.log(`📱 [${taskId}] 🔐 어느 Google 계정으로든 로그인하세요!`);
+    console.log(`📍 매장 주소: ${shortUrl}`);
+    console.log(`📲 로그인 후에 "계속 진행"을 클릭해주세요.`);
+    console.log(`${'='.repeat(60)}\n`);
 
-    // 계정별 저장된 프로필 디렉토리 (첫 로그인만 수동, 이후는 자동)
-    const profileDir = path.join(
-      process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE, 'AppData', 'Local'),
-      'Playwright', 'google-maps-profiles'
-    );
-    
-    const safeEmail = account.email.replace(/[^a-z0-9]/gi, '_');
-    const profilePath = path.join(profileDir, safeEmail);
-    
-    if (!fs.existsSync(profilePath)) {
-      fs.mkdirSync(profilePath, { recursive: true });
-    }
-
-    const isFirstLogin = !fs.existsSync(path.join(profilePath, 'Default'));
-
-    await logger.info(taskId, `프로필 경로: ${profilePath}`);
-    if (isFirstLogin) {
-      await logger.warn(taskId, '첫 로그인 - 120초 내에 수동 로그인 필요');
-    } else {
-      await logger.info(taskId, '저장된 프로필 사용 중...');
-    }
-
-    // Chrome 실행 (계정별 저장된 프로필 사용)
-    browser = await chromium.launchPersistentContext(profilePath, {
+    browser = await chromium.launch({
       headless: false,
-      channel: 'chrome',
       args: [
         '--disable-blink-features=AutomationControlled',
         '--no-default-browser-check',
@@ -393,10 +377,11 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
         '--disable-component-extensions-with-background-pages',
         '--disable-default-apps',
         '--disable-preconnect',
+        '--start-maximized',
       ],
     });
 
-    const page = browser.pages()[0] || await browser.newPage();
+    const page = await browser.newPage();
 
     // 콘솔 오류 억제 (확장 오류 무시)
     page.on('console', msg => {
@@ -434,69 +419,54 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
       };
     });
 
-    // 첫 로그인인 경우만 수동 로그인 필요
-    if (isFirstLogin) {
-      await logger.info(taskId, '🔐 첫 로그인 - 수동 로그인 필요');
-      await logger.info(taskId, '📍 https://accounts.google.com/signin 에서 로그인해주세요');
-      await logger.info(taskId, '⏳ 120초 동안 기다리는 중...');
+    // ✅ 로그인 대기: 매번 깨끗한 상태에서 시작하므로 항상 사용자 로그인 필요
+    await logger.info(taskId, '🔐 수동 로그인 필요');
+    await logger.info(taskId, '📍 Google 계정으로 로그인하세요');
+    await logger.info(taskId, '📲 로그인 완료 후 "계속 진행" 버튼을 클릭해주세요');
 
-      // Google 로그인 페이지로 이동
-      await page.goto('https://accounts.google.com/signin', { waitUntil: 'load', timeout: 10000 });
+    // Google 로그인 페이지로 이동
+    await page.goto('https://accounts.google.com/signin', { waitUntil: 'load', timeout: 10000 }).catch(() => {});
 
-      // 사용자가 수동으로 로그인할 때까지 120초 대기
-      let loggedIn = false;
-      const startTime = Date.now();
-      const timeout = 120000; // 120초
+    // ✅ 사용자가 "계속 진행" 또는 "취소"를 클릭할 때까지 대기
+    console.log(`⏳ [${taskId}] 사용자 입력 대기 중...`);
+    await logger.info(taskId, '📱 "계속 진행" 또는 "취소" 버튼을 기다리는 중...');
 
-      while (Date.now() - startTime < timeout) {
-        try {
-          const url = page.url();
-          // 계정 페이지 또는 로그인 완료 확인
-          if (!url.includes('accounts.google.com') || url.includes('myaccount')) {
-            loggedIn = true;
-            await logger.info(taskId, '✅ 로그인 감지!');
-            await page.waitForTimeout(2000);
-            break;
-          }
-        } catch (e) {
-          // 무시
-        }
-        await page.waitForTimeout(1000);
-      }
+    // Promise 생성 및 저장
+    let resolveWait;
+    const waitPromise = new Promise(resolve => {
+      resolveWait = resolve;
+    });
+    processWaiters.set(taskId, resolveWait);
 
-      if (!loggedIn) {
-        await browser.close();
-        await logger.error(taskId, '로그인 시간 초과 (120초)');
-        await logger.updateStatus(taskId, { status: 'failed', review_status: 'failed' });
-        return res.status(400).json({ error: '로그인 시간 초과 (120초)' });
-      }
-    } else {
-      await logger.info(taskId, '✅ 저장된 세션으로 자동 로그인됨');
-    }
-
-    // work_account가 제대로 저장되었는지 확인
-    const { data: updatedTask } = await supabase
-      .from('tasks')
-      .select('work_account')
-      .eq('id', dbTaskId)
-      .single();
-
-    const savedWorkAccount = updatedTask?.work_account || explicitWorkAccount;
-    console.log(`[${taskId}] ✅ work_account 저장됨: ${savedWorkAccount}`);
-
-    // 백그라운드 처리 시작 (작업 ID 기록)
-    backgroundTask(page, shortUrl, notes, account.email, browser, profilePath, req.user.id, taskId, storeId);
-
+    // ✅ 응답을 먼저 보냄!
+    const userEmail = explicitWorkAccount?.trim() || req.user.id || 'unknown';
     res.json({
       placeName: '로딩 중...',
       message: `✅ 자동화 시작됨 (${totalCount}개 작업 생성). 브라우저에서 리뷰를 작성해주세요. (2분 후 자동 종료)`,
-      usedAccount: account.email,
-      workAccount: savedWorkAccount,
+      usedAccount: userEmail,
+      workAccount: explicitWorkAccount?.trim() || null,
       taskId: taskId,
       dbTaskId: dbTaskId,
       totalCount: totalCount,
       createdTasks: totalCount
     });
+
+    // ✅ 그 다음에 대기
+    const result = await waitPromise;
+    processWaiters.delete(taskId);
+
+    if (result === 'cancel') {
+      await browser.close();
+      await logger.warn(taskId, '사용자가 취소함');
+      await logger.updateStatus(taskId, { status: 'cancelled', review_status: 'pending' });
+      return;
+    }
+
+    console.log(`✅ [${taskId}] 계속 진행!`);
+    await logger.info(taskId, '✅ 프로세스 진행!');
+
+    // ✅ 계속 진행 신호 받은 후 자동화 시작!
+    await backgroundTask(page, shortUrl, notes, userEmail, browser, null, req.user.id, taskId, storeId);
 
   } catch (error) {
     if (browser) await browser.close();
@@ -508,6 +478,9 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
 // 백그라운드에서 자동화 작업 처리
 async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, userId, taskId, storeId) {
   try {
+    // dbTaskId 추출 (taskId 형식: "task_105")
+    const dbTaskId = parseInt(taskId.split('_')[1]);
+    
     // 작업 상태 초기화
     await logger.updateStatus(taskId, {
       status: 'in_progress',
@@ -1088,8 +1061,24 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
             
             await logger.updateStatus(taskId, updateData);
             
+            // ✅ completed_count 증가
             if (shouldIncrementCount) {
               await logger.info(taskId, `✅ 발행 진행: ${countReason}`);
+              // DB에 completed_count 증가
+              const { data: currentTask } = await supabase
+                .from('tasks')
+                .select('completed_count')
+                .eq('id', dbTaskId)
+                .single();
+              
+              const newCount = (currentTask?.completed_count || 0) + 1;
+              await supabase
+                .from('tasks')
+                .update({ completed_count: newCount })
+                .eq('id', dbTaskId);
+              
+              console.log(`[${taskId}] ✅ completed_count 증가: ${newCount}`);
+              await logger.info(taskId, `📊 현재발행수: ${newCount}`);
             } else {
               await logger.info(taskId, `⏳ 발행 대기 중: ${countReason}`);
             }
@@ -1275,20 +1264,52 @@ app.post('/api/extract-review-link', authMiddleware, async (req, res) => {
     const workAccount = task.work_account.trim();
     console.log(`🔗 [${taskIdStr}] 시작: ${workAccount} - ${store.address}`);
     
-    // Playwright 시작
-    browser = await chromium.launch({ headless: true });
+    // Playwright 시작 - 브라우저 보이기 (사용자가 로그인할 수 있도록)
+    browser = await chromium.launch({ 
+      headless: false,  // ✅ 브라우저 띄우기
+      args: ['--start-maximized']
+    });
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+      // ✅ 쿠키/저장된 로그인정보 제거 - 깨끗한 상태로 시작
+      ignoreHTTPSErrors: true,
     });
     const page = await context.newPage();
     
+    // ✅ 로그인 대기: 페이지를 열기 전에 "로그인을 해주세요" 메시지 표시
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`📱 [${taskIdStr}] 🔐 ${workAccount} 계정으로 로그인을 완료하세요!`);
+    console.log(`📍 매장: ${store.address}`);
+    console.log(`📲 로그인 후에 "계속 진행"을 클릭해주세요.`);
+    console.log(`${'='.repeat(60)}\n`);
+    
     // 1. 매장 페이지 열기
     await page.goto(store.address, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(3000);
+    
+    // ✅ 사용자가 "계속 진행"을 클릭할 때까지 대기
+    console.log(`⏳ [${taskIdStr}] 사용자 입력 대기 중...`);
+    
+    // Promise 생성 및 저장
+    let resolveWait;
+    const waitPromise = new Promise(resolve => {
+      resolveWait = resolve;
+    });
+    processWaiters.set(taskIdStr, resolveWait);
+
+    const result = await waitPromise;
+    processWaiters.delete(taskIdStr);
+
+    if (result === 'cancel') {
+      await browser.close();
+      console.error(`❌ [${taskIdStr}] 사용자가 취소함`);
+      return res.status(400).json({ error: '사용자가 취소함' });
+    }
+
+    console.log(`✅ [${taskIdStr}] 계속 진행!`);
     
     // 2. 리뷰 섹션 활성화 후 HTML 저장
-    const fs = require('fs');
-    const path = require('path');
+    const fsModule = require('fs');
+    const pathModule = require('path');
     
     // 1. Reviews 버튼 클릭 (리뷰 탭 활성화)
     console.log(`[${taskIdStr}] 🔍 Reviews 버튼 찾기...`);
@@ -1317,8 +1338,8 @@ app.post('/api/extract-review-link', authMiddleware, async (req, res) => {
     for (const frame of frames) {
       try {
         const htmlContent = await frame.content();
-        const debugPath = path.join(__dirname, `debug_${taskIdStr}.html`);
-        fs.writeFileSync(debugPath, htmlContent, 'utf-8');
+        const debugPath = pathModule.join(__dirname, `debug_${taskIdStr}.html`);
+        fsModule.writeFileSync(debugPath, htmlContent, 'utf-8');
         console.log(`[${taskIdStr}] 📄 HTML 저장: ${debugPath}`);
         
         // 페이지 분석
@@ -1393,10 +1414,82 @@ app.post('/api/extract-review-link', authMiddleware, async (req, res) => {
   }
 });
 
+// ✅ 계속 진행 버튼 클릭 처리
+app.post('/api/continue/:taskId', authMiddleware, (req, res) => {
+  const { taskId } = req.params;
+  
+  if (!processWaiters.has(taskId)) {
+    return res.status(404).json({ error: `${taskId}를 찾을 수 없습니다.` });
+  }
+  
+  const resolve = processWaiters.get(taskId);
+  resolve('continue'); // Promise 완료
+  
+  console.log(`✅ [${taskId}] 계속 진행 신호 받음!`);
+  res.json({ success: true, message: `${taskId} 프로세스 진행됨` });
+});
+
+// ✅ 취소 버튼 클릭 처리
+app.post('/api/cancel/:taskId', authMiddleware, (req, res) => {
+  const { taskId } = req.params;
+  
+  if (!processWaiters.has(taskId)) {
+    return res.status(404).json({ error: `${taskId}를 찾을 수 없습니다.` });
+  }
+  
+  const resolve = processWaiters.get(taskId);
+  resolve('cancel'); // 취소 신호
+  
+  console.log(`❌ [${taskId}] 취소 신호 받음!`);
+  res.json({ success: true, message: `${taskId} 프로세스 취소됨` });
+});
+
 // 수동 링크 저장
+app.post('/api/tasks/:taskId/review-link', authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin 권한이 필요합니다.' });
+    }
+
+    const { taskId } = req.params;
+    const { review_share_link } = req.body;
+
+    if (!review_share_link || !review_share_link.trim()) {
+      return res.status(400).json({ error: '링크를 입력해주세요.' });
+    }
+
+    if (!review_share_link.includes('maps')) {
+      return res.status(400).json({ error: '유효한 Google Maps 링크가 아닙니다.' });
+    }
+
+    const dbId = typeof taskId === 'string' && taskId.startsWith('task_')
+      ? parseInt(taskId.split('_')[1])
+      : taskId;
+
+    // ✅ review_share_link 저장 + review_status를 'completed'로 변경
+    const { data: updatedTask, error } = await supabase
+      .from('tasks')
+      .update({ 
+        review_share_link: review_share_link.trim(),
+        review_status: 'completed'  // ✅ 링크 저장 시 상태를 "완료"로 변경
+      })
+      .eq('id', dbId)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: 'DB 업데이트 실패' });
+    }
+
+    console.log(`✅ [task_${dbId}] 수동 링크 저장 + 상태 변경: ${review_share_link}`);
+    res.json({ success: true, review_share_link, updatedTask });
+  } catch (error) {
+    console.error('❌ 링크 저장 실패:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 Automation backend listening on port ${PORT}`);
-  console.log(`📧 Available accounts: ${googleAccounts.length}`);
 });
