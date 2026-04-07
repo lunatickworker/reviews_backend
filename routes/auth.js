@@ -59,6 +59,11 @@ router.post('/register', authMiddleware, async (req, res) => {
   const { userId, password, role } = req.body;
   const currentUserId = req.user.userId; // 현재 로그인된 사용자
 
+  // 🔐 권한 검증: Admin만 새로운 사용자 생성 가능
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: '관리자 권한이 필요합니다.' });
+  }
+
   if (!userId || !password) {
     return res.status(400).json({ error: '아이디와 비번을 입력하세요.' });
   }
