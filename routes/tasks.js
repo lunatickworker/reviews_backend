@@ -12,9 +12,9 @@ router.get('/', authMiddleware, async (req, res) => {
       .select('id, place_name, stars, image_uploaded, status, review_status, image_status, current_step, notes, work_account, review_share_link, user_id, store_id, task_id, completed_count, created_at, updated_at, user:user_id(user_id, superior_name), store:store_id(id, store_name, daily_frequency, total_count)')
       .order('created_at', { ascending: false });
 
-    // agency 권한: 자신이 소유한 매장의 작업만 조회 (store_id로 필터링)
-    if (req.user.role === 'agency') {
-      // 1. Agency가 소유한 stores 조회
+    // admin이 아니면 자신이 소유한 매장의 작업만 조회
+    if (req.user.role !== 'admin') {
+      // 1. 현재 사용자가 소유한 stores 조회
       const { data: userStores, error: storesError } = await supabase
         .from('stores')
         .select('id')
@@ -30,7 +30,6 @@ router.get('/', authMiddleware, async (req, res) => {
         query = query.in('store_id', storeIds);
       } else {
         // store가 없으면 빈 결과 반환
-        // ✅ Supabase에서 NULL 비교는 .is() 사용
         query = query.is('store_id', null);
       }
     }
