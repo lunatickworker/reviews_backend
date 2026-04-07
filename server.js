@@ -7,6 +7,10 @@ const fs = require('fs');
 const { EventEmitter } = require('events');
 require('dotenv').config();
 
+// 작업 큐 import
+const { deployQueue } = require('./queue');
+const deployWorker = require('./worker');
+
 // 라우트 import
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
@@ -34,6 +38,36 @@ app.use(cors(corsOptions));
 
 // ✅ 프로세스 진행 신호 대기 (taskId → Promise)
 const processWaiters = new Map();
+
+// ✅ 배포 동시성 제어 (최대 5개까지 동시 실행)
+const CONCURRENT_DEPLOYS = 5;
+const activeDeployments = new Map(); // taskId → deployment promise
+const deploymentQueue = []; // 대기 중인 배포 요청 큐
+
+// 배포 시작 (동시성 제어)
+const startDeployment = async (taskId, deployFn) => {
+  try {
+    // 활성 배포가 제한 수 이하일 때까지 대기
+    while (activeDeployments.size >= CONCURRENT_DEPLOYS) {
+      await new Promise(resolve => setTimeout(resolve, 100)); // 100ms 대기
+    }
+
+    console.log(`🚀 [${taskId}] 배포 시작 (활성: ${activeDeployments.size + 1}/${CONCURRENT_DEPLOYS})`);
+
+    // 배포 실행 및 추적
+    const deployPromise = deployFn()
+      .finally(() => {
+        activeDeployments.delete(taskId);
+        console.log(`✅ [${taskId}] 배포 완료 (활성: ${activeDeployments.size}/${CONCURRENT_DEPLOYS})`);
+      });
+
+    activeDeployments.set(taskId, deployPromise);
+    return await deployPromise;
+  } catch (err) {
+    activeDeployments.delete(taskId);
+    throw err;
+  }
+};
 
 // 사용자 데이터 디렉토리 (쿠키/세션 저장)
 const userDataDir = path.join(__dirname, '.auth');
