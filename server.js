@@ -1045,76 +1045,87 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
             await logger.info(taskId, `✅ 별점 선택 완료 (${starClicked.method})`);
             await page.waitForTimeout(500);
             
-            // 이미지 유무에 따른 completed_count 결정 로직
-            let shouldIncrementCount = false;
-            let countReason = '';
+            // ✅ 별점 저장 + review_status 초기화 (사용자 입력 감지용)
+            await logger.updateStatus(taskId, {
+              stars: 5,
+              review_status: 'pending',  // ✅ 명시적으로 pending 설정
+              image_status: 'pending',   // ✅ 명시적으로 pending 설정
+              current_step: '별점 선택 완료 - 사용자 입력 대기 중',
+            });
+
+            // 🎯 사용자 입력 대기 상태 로그
+            console.log(`[${taskId}] ⏳ 프론트엔드 모달 대기 중...`);
+            await logger.info(taskId, '⏳ 사용자 입력 대기 중...');
+            await logger.info(taskId, '📱 프론트엔드에서 "리뷰만 완료" 또는 "리뷰+이미지 완료" 버튼 클릭 대기');
             
-            // 매장의 이미지 정보 확인
-            if (storeId) {
-              const { data: storeData } = await supabase
-                .from('stores')
-                .select('image_urls')
-                .eq('id', storeId)
+            // 사용자 선택 감지 (5분 타임아웃)
+            let userChoseReviewStatus = null;
+            let userChoseImageStatus = null;
+            let waitStartTime = Date.now();
+            const WAIT_TIMEOUT = 5 * 60 * 1000; // 5분
+            
+            while (Date.now() - waitStartTime < WAIT_TIMEOUT) {
+              // DB에서 현재 상태 조회
+              const { data: currentTaskCheck } = await supabase
+                .from('tasks')
+                .select('review_status, image_status')
+                .eq('id', dbTaskId)
                 .single();
               
-              if (storeData) {
-                const hasImages = storeData.image_urls && Array.isArray(storeData.image_urls) && storeData.image_urls.length > 0;
-                
-                if (!hasImages) {
-                  // 이미지 없음: 리뷰 완료만으로 카운트 증가
-                  shouldIncrementCount = true;
-                  countReason = '이미지 없음 - 리뷰만 완료하면 카운트';
-                  console.log(`[${taskId}] ℹ️ 이 매장은 이미지 정보가 없어서 리뷰 완료로 카운트 증가`);
-                } else {
-                  // 이미지 있음: 현재 task의 image_status 확인
-                  const { data: taskData } = await supabase
-                    .from('tasks')
-                    .select('image_status')
-                    .eq('id', dbTaskId)
-                    .single();
-                  
-                  if (taskData && (taskData.image_status === 'completed' || taskData.image_status === 'ready')) {
-                    shouldIncrementCount = true;
-                    countReason = '이미지 설정됨 - 리뷰/이미지 모두 완료되어 카운트';
-                    console.log(`[${taskId}] ℹ️ 이미지도 완료됨 (${taskData.image_status}) - 카운트 증가`);
-                  } else {
-                    shouldIncrementCount = false;
-                    countReason = `이미지 설정됨 - 이미지 상태가 ${taskData?.image_status || 'pending'}이라 아직 카운트 안함`;
-                    console.log(`[${taskId}] ℹ️ 이미지가 아직 미완료 (${taskData?.image_status || 'pending'}) - 카운트 미증가`);
-                  }
+              // review_status가 'in_progress'로 변경되었는지 확인 (pending에서 변경)
+              if (currentTaskCheck) {
+                if (currentTaskCheck.review_status === 'in_progress') {
+                  userChoseReviewStatus = currentTaskCheck.review_status;
+                  userChoseImageStatus = currentTaskCheck.image_status;
+                  console.log(`[${taskId}] ✅ 사용자 선택 감지: review=${userChoseReviewStatus}, image=${userChoseImageStatus}`);
+                  await logger.info(taskId, `✅ 사용자 선택 감지: review=${userChoseReviewStatus}, image=${userChoseImageStatus}`);
+                  break; // 루프 종료
                 }
               }
+              
+              // 1초마다 확인
+              await new Promise(resolve => setTimeout(resolve, 1000));
             }
             
-            // 별점 선택 완료 = 자동화 완료, 조건에 따라 진행 상태 업데이트
-            const updateData = {
-              status: 'completed',
-              review_status: 'completed',
-              current_step: '리뷰 작성 준비 완료',
-            };
+            // 타임아웃 체크
+            if (!userChoseReviewStatus) {
+              console.log(`[${taskId}] ❌ 사용자 입력 타임아웃 (5분 경과)`);
+              await logger.error(taskId, '❌ 사용자 입력 타임아웃 (5분)');
+              return; // 작업 종료
+            }
             
-            await logger.updateStatus(taskId, updateData);
+            // 이미지 정보 조회
+            const { data: storeDataFinal } = await supabase
+              .from('stores')
+              .select('image_urls')
+              .eq('id', storeId)
+              .single();
             
-            // ✅ completed_count 증가
-            if (shouldIncrementCount) {
-              await logger.info(taskId, `✅ 발행 진행: ${countReason}`);
-              // DB에 completed_count 증가
-              const { data: currentTask } = await supabase
+            const storeHasImages = storeDataFinal?.image_urls && Array.isArray(storeDataFinal.image_urls) && storeDataFinal.image_urls.length > 0;
+            
+            // 카운트 증가 결정
+            const shouldIncrementFinal = 
+              (userChoseImageStatus === 'pending') ? 
+                !storeHasImages : // 리뷰만: 이미지 없을 때만 증가
+                true; // 리뷰+이미지: 항상 증가
+            
+            if (shouldIncrementFinal) {
+              const { data: currentTaskData } = await supabase
                 .from('tasks')
                 .select('completed_count')
                 .eq('id', dbTaskId)
                 .single();
               
-              const newCount = (currentTask?.completed_count || 0) + 1;
+              const newCount = (currentTaskData?.completed_count || 0) + 1;
               await supabase
                 .from('tasks')
                 .update({ completed_count: newCount })
                 .eq('id', dbTaskId);
               
               console.log(`[${taskId}] ✅ completed_count 증가: ${newCount}`);
-              await logger.info(taskId, `📊 현재발행수: ${newCount}`);
+              await logger.info(taskId, `✅ 발행 진행: 카운트 증가 (현재: ${newCount})`);
             } else {
-              await logger.info(taskId, `⏳ 발행 대기 중: ${countReason}`);
+              await logger.info(taskId, `⏳ 발행 대기: 리뷰만 완료, 이미지 대기 중`);
             }
             
             await logger.info(taskId, '📝 브라우저에서 리뷰를 작성하고 제출해주세요');
