@@ -9,7 +9,7 @@ router.get('/', authMiddleware, async (req, res) => {
   try {
     let query = supabase
       .from('tasks')
-      .select('id, place_name, stars, image_uploaded, status, review_status, image_status, current_step, notes, work_account, user_id, store_id, task_id, completed_count, created_at, updated_at, user:user_id(user_id, superior_name), store:store_id(id, store_name, daily_frequency, total_count)')
+      .select('id, place_name, stars, image_uploaded, status, review_status, image_status, current_step, notes, work_account, user_id, store_id, task_id, completed_count, created_at, updated_at, user:user_id(user_id, superior_name), store:store_id(id, store_name, daily_frequency, total_count, user_id)')
       .order('created_at', { ascending: false });
 
     // agency 권한: 자신이 소유한 매장의 작업만 조회 (store_id로 필터링)
@@ -176,6 +176,53 @@ router.get('/user/:userId', authMiddleware, async (req, res) => {
     res.json(data);
   } catch (error) {
     console.error('작업 조회 오류:', error);
+    res.status(500).json({ error: '서버 오류가 발생했습니다.' });
+  }
+});
+
+// 리뷰 링크 저장
+router.post('/:id/review-link', authMiddleware, async (req, res) => {
+  try {
+    const { review_share_link } = req.body;
+    
+    if (!review_share_link) {
+      return res.status(400).json({ error: '링크가 필요합니다.' });
+    }
+
+    // Task 조회 및 권한 검증
+    const { data: task, error: fetchError } = await supabase
+      .from('tasks')
+      .select('id, user_id')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchError || !task) {
+      return res.status(404).json({ error: '작업을 찾을 수 없습니다.' });
+    }
+
+    // 🔐 권한 검증: Admin이거나 본인의 작업인지 확인
+    if (req.user.role !== 'admin') {
+      if (task.user_id !== req.user.id) {
+        return res.status(403).json({ error: '권한이 없습니다.' });
+      }
+    }
+
+    // 링크 저장
+    const { data: updatedTask, error: updateError } = await supabase
+      .from('tasks')
+      .update({ review_share_link })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('링크 업데이트 오류:', updateError);
+      return res.status(500).json({ error: '링크 저장에 실패했습니다.' });
+    }
+
+    res.json({ updatedTask });
+  } catch (error) {
+    console.error('리뷰 링크 저장 오류:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
   }
 });
