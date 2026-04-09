@@ -345,24 +345,21 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
       }
     }
     
-    // 2. totalCount만큼 tasks 생성
+    // 2. 작업 1개만 생성 (총발행수는 task 필드에 저장, 반복 실행은 별도 로직)
     const taskIds = [];
-    const tasksToInsert = [];
-    
-    for (let i = 0; i < Math.max(1, totalCount); i++) {
-      tasksToInsert.push({
-        place_name: placeName,
-        status: i === 0 ? 'in_progress' : 'pending',     // 첫 번째만 진행중, 나머지는 대기
-        review_status: 'pending',
-        image_status: 'pending',
-        current_step: i === 0 ? '시작' : '대기중',
-        notes: notes ? notes.trim() : '',
-        store_id: storeId || null,  // ✅ 매장 ID 저장
-        user_id: req.user.id,
-        work_account: explicitWorkAccount?.trim() || null,
-        created_at: new Date().toISOString(),
-      });
-    }
+    const tasksToInsert = [{
+      place_name: placeName,
+      status: 'in_progress',
+      review_status: 'pending',
+      image_status: 'pending',
+      current_step: '시작',
+      notes: notes ? notes.trim() : '',
+      store_id: storeId || null,  // ✅ 매장 ID 저장
+      user_id: req.user.id,
+      work_account: explicitWorkAccount?.trim() || null,
+      total_count: storeTotalCount,  // ✅ 총발행수 저장 (작업이 반복될 횟수)
+      created_at: new Date().toISOString(),
+    }];
 
     const { data: taskDataArray, error: taskError } = await supabase
       .from('tasks')
@@ -374,22 +371,19 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
       return res.status(500).json({ error: '작업 생성에 실패했습니다.' });
     }
 
-    // 첫 번째 task만 Playwright로 실행
+    // ✅ 작업 1개 생성 완료
     const dbTaskId = taskDataArray[0].id;
     const taskId = `task_${dbTaskId}`;
     
-    // 모든 task의 task_id 업데이트
-    for (let i = 0; i < taskDataArray.length; i++) {
-      const dataTaskId = `task_${taskDataArray[i].id}`;
-      await supabase
-        .from('tasks')
-        .update({ task_id: dataTaskId })
-        .eq('id', taskDataArray[i].id);
-    }
+    // task_id 업데이트
+    await supabase
+      .from('tasks')
+      .update({ task_id: taskId })
+      .eq('id', dbTaskId);
 
-    console.log(`📋 ${totalCount}개 작업 생성됨: 첫 번째 ID=${dbTaskId}, taskId=${taskId}`);
+    console.log(`📋 작업 1개 생성됨: ID=${dbTaskId}, 총발행 예정=${storeTotalCount}회`);
     console.log(`📝 Notes: "${notes ? notes.trim() : '(없음)'}"`);
-    await logger.info(taskId, `배포 시작: ${totalCount}개 작업 생성, shortUrl=${shortUrl}`, { user: req.user.id, totalCount });
+    await logger.info(taskId, `배포 시작: 1개 작업 생성, 총발행 ${storeTotalCount}회 예정, shortUrl=${shortUrl}`, { user: req.user.id, totalCount: storeTotalCount });
     if (notes) {
       await logger.info(taskId, `📝 메모: ${notes}`);
     }
@@ -398,7 +392,7 @@ app.post('/api/automate-map', authMiddleware, async (req, res) => {
     console.log(`${'='.repeat(60)}`);
     console.log(`📱 [${taskId}] 🔐 어느 Google 계정으로든 로그인하세요!`);
     console.log(`📍 매장 주소: ${shortUrl}`);
-    console.log(`📲 로그인 후에 "계속 진행"을 클릭해주세요.`);
+    console.log(`📲 로그인 후에 "계속 진행"을 클릭해주세요. (${storeTotalCount}회 반복)`);
     console.log(`${'='.repeat(60)}\n`);
 
     browser = await chromium.launch({
