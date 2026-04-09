@@ -54,14 +54,39 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// 회원가입 (관리자만 가능 - 현재 로그인된 사용자가 상위명이 됨)
+// 회원가입 (admin은 항상 가능, agency는 설정 확인)
 router.post('/register', authMiddleware, async (req, res) => {
   const { userId, password, role } = req.body;
   const currentUserId = req.user.userId; // 현재 로그인된 사용자
 
-  // 🔐 권한 검증: Admin만 새로운 사용자 생성 가능
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ error: '관리자 권한이 필요합니다.' });
+  // Admin은 항상 가능, Agency는 설정 확인
+  if (req.user.role === 'admin') {
+    // Admin은 항상 가능
+  } else if (req.user.role === 'agency') {
+    // Agency는 설정 확인 (비활성화 = 기본값 = 거부)
+    const { data: settings, error: settingsError } = await supabase
+      .from('admin_settings')
+      .select('allow_agency_create_account')
+      .limit(1)
+      .single();
+
+    console.log(`🔍 [auth.register] Agency 권한 확인:`, {
+      user_id: req.user.id,
+      settingsError: settingsError?.code,
+      setting_value: settings?.allow_agency_create_account
+    });
+
+    // 설정이 명시적으로 true가 아니면 모두 거부
+    const isAllowed = settings?.allow_agency_create_account === true;
+    
+    if (!isAllowed) {
+      console.log(`❌ [auth.register] Agency 거부 - 권한 없음`);
+      return res.status(403).json({ error: '사용자 생성 권한이 없습니다.' });
+    }
+    
+    console.log(`✅ [auth.register] Agency 허용`);
+  } else {
+    return res.status(403).json({ error: '권한이 없습니다.' });
   }
 
   if (!userId || !password) {

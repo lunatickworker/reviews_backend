@@ -23,13 +23,38 @@ router.get('/', authMiddleware, async (req, res) => {
   }
 });
 
-// ✅ 계정 추가 (admin만)
+// ✅ 계정 추가 (admin / agency with permission)
 router.post('/', authMiddleware, async (req, res) => {
   const { email } = req.body;
 
-  // admin 권한 확인
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'admin 권한이 필요합니다.' });
+  // admin은 항상 가능, agency는 설정 확인 필요
+  if (req.user.role === 'admin') {
+    // Admin은 항상 가능
+  } else if (req.user.role === 'agency') {
+    // Agency는 설정 확인 (비활성화 = 기본값 = 거부)
+    const { data: settings, error: settingsError } = await supabase
+      .from('admin_settings')
+      .select('allow_agency_create_account')
+      .limit(1)
+      .single();
+
+    console.log(`🔍 [accounts.post] Agency 권한 확인:`, {
+      user_id: req.user.id,
+      settingsError: settingsError?.code,
+      setting_value: settings?.allow_agency_create_account
+    });
+
+    // 설정이 명시적으로 true가 아니면 모두 거부
+    const isAllowed = settings?.allow_agency_create_account === true;
+    
+    if (!isAllowed) {
+      console.log(`❌ [accounts.post] Agency 거부 - 권한 없음`);
+      return res.status(403).json({ error: '계정 생성 권한이 없습니다.' });
+    }
+    
+    console.log(`✅ [accounts.post] Agency 허용`);
+  } else {
+    return res.status(403).json({ error: '권한이 없습니다.' });
   }
 
   if (!email || !email.trim()) {

@@ -137,7 +137,12 @@ const deployWorker = new Worker(
   }
 );
 
-// 워커 이벤트
+// 모든 Redis 에러 무시
+deployWorker.on('error', () => {
+  // 무시
+});
+
+// 워커 이벤트 (정상 작동만)
 deployWorker.on('completed', (job) => {
   console.log(`✅ Worker: Job ${job.id} 완료`);
 });

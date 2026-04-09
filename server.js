@@ -17,6 +17,7 @@ const userRoutes = require('./routes/users');
 const storeRoutes = require('./routes/stores');
 const taskRoutes = require('./routes/tasks');
 const reviewRoutes = require('./routes/reviews');
+const settingsRoutes = require('./routes/settings');
 const authMiddleware = require('./auth-middleware');
 const logger = require('./logger');
 const supabase = require('./supabaseClient');
@@ -85,6 +86,7 @@ const logRoutes = require('./routes/logs');
 app.use('/api/logs', logRoutes);
 const accountRoutes = require('./routes/accounts');
 app.use('/api/accounts', accountRoutes);
+app.use('/api/settings', settingsRoutes);
 
 // Supabase Storage에 스크린샷 업로드
 async function uploadScreenshot(screenshotBuffer, taskId, dbTaskId) {

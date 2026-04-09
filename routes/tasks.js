@@ -9,12 +9,12 @@ router.get('/', authMiddleware, async (req, res) => {
   try {
     let query = supabase
       .from('tasks')
-      .select('id, place_name, stars, image_uploaded, status, review_status, image_status, current_step, notes, work_account, review_share_link, user_id, store_id, task_id, completed_count, created_at, updated_at, user:user_id(user_id, superior_name), store:store_id(id, store_name, daily_frequency, total_count)')
+      .select('id, place_name, stars, image_uploaded, status, review_status, image_status, current_step, notes, work_account, user_id, store_id, task_id, completed_count, created_at, updated_at, user:user_id(user_id, superior_name), store:store_id(id, store_name, daily_frequency, total_count)')
       .order('created_at', { ascending: false });
 
-    // admin이 아니면 자신이 소유한 매장의 작업만 조회
-    if (req.user.role !== 'admin') {
-      // 1. 현재 사용자가 소유한 stores 조회
+    // agency 권한: 자신이 소유한 매장의 작업만 조회 (store_id로 필터링)
+    if (req.user.role === 'agency') {
+      // 1. Agency가 소유한 stores 조회
       const { data: userStores, error: storesError } = await supabase
         .from('stores')
         .select('id')
@@ -29,8 +29,8 @@ router.get('/', authMiddleware, async (req, res) => {
       if (storeIds.length > 0) {
         query = query.in('store_id', storeIds);
       } else {
-        // store가 없으면 빈 결과 반환
-        query = query.is('store_id', null);
+        // store가 없으면 빈 결과 반환 (불가능한 조건)
+        query = query.eq('store_id', null);
       }
     }
 
@@ -219,55 +219,6 @@ router.post('/:id/reset', authMiddleware, async (req, res) => {
     res.json({ message: '작업이 리셋되었습니다.', task: data[0] });
   } catch (error) {
     console.error('작업 리셋 오류:', error);
-    res.status(500).json({ error: '서버 오류가 발생했습니다.' });
-  }
-});
-
-// 리뷰 공유 링크 저장
-router.post('/:id/review-link', authMiddleware, async (req, res) => {
-  try {
-    const { review_share_link } = req.body;
-
-    if (!review_share_link || !review_share_link.trim()) {
-      return res.status(400).json({ error: '링크는 필수입니다.' });
-    }
-
-    // agency 권한 확인: 본인의 작업인지 확인
-    if (req.user.role === 'agency') {
-      const { data: task } = await supabase
-        .from('tasks')
-        .select('user_id')
-        .eq('id', req.params.id)
-        .single();
-
-      if (!task || task.user_id !== req.user.id) {
-        return res.status(403).json({ error: '권한이 없습니다.' });
-      }
-    }
-
-    const updateData = {
-      review_share_link: review_share_link.trim(),
-      updated_at: new Date().toISOString(),
-    };
-
-    console.log('💾 리뷰 링크 저장:', {
-      id: req.params.id,
-      review_share_link: review_share_link.trim(),
-      user: req.user.id
-    });
-
-    const { data, error } = await supabase
-      .from('tasks')
-      .update(updateData)
-      .eq('id', req.params.id)
-      .select();
-
-    if (error) throw error;
-
-    console.log('✅ 리뷰 링크 저장 성공:', data[0]?.id);
-    res.json({ message: '링크가 저장되었습니다.', updatedTask: data[0] });
-  } catch (error) {
-    console.error('❌ 리뷰 링크 저장 오류:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
   }
 });

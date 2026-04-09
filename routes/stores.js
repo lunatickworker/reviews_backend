@@ -88,7 +88,41 @@ router.post('/', authMiddleware, async (req, res) => {
     // 오늘 날짜 (YYYY-MM-DD 형식)
     const today = new Date().toISOString().split('T')[0];
 
-    // 📌 새 매장 생성 (각 업로드를 개별적으로 저장)
+    // 같은 이름 + 같은 날짜의 매장들 조회
+    const { data: existingStores, error: checkError } = await supabase
+      .from('stores')
+      .select('id, total_count, created_at')
+      .eq('store_name', storeName)
+      .eq('user_id', req.user.id);
+
+    if (checkError) throw checkError;
+
+    // 오늘 등록된 같은 이름의 매장들 필터링
+    const todayStores = (existingStores || []).filter(store => {
+      const storeDate = store.created_at.split('T')[0];
+      return storeDate === today;
+    });
+
+    let finalTotalCount = totalCnt;
+
+    if (todayStores && todayStores.length > 0) {
+      // 오늘 등록된 같은 이름 매장들의 합 + 새로운 값 = 최종 total_count
+      const sumOfExisting = todayStores.reduce((sum, store) => sum + (store.total_count || 0), 0);
+      finalTotalCount = sumOfExisting + totalCnt;
+
+      // 📌 기존의 모든 같은 날짜 매장들의 total_count를 최종값으로 통일
+      for (const store of todayStores) {
+        await supabase
+          .from('stores')
+          .update({
+            total_count: finalTotalCount,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', store.id);
+      }
+    }
+
+    // 📌 새 매장 생성 (deployed_count: 0)
     const { data, error } = await supabase
       .from('stores')
       .insert([
@@ -99,7 +133,7 @@ router.post('/', authMiddleware, async (req, res) => {
           draft_reviews: draftReviews || '',
           image_urls: processedImageUrls,
           daily_frequency: dailyFreq,
-          total_count: totalCnt,  // 입력받은 값을 그대로 저장 (통합하지 않음)
+          total_count: finalTotalCount,
           deployed_count: 0,
           user_id: req.user.id,
           created_at: new Date().toISOString(),
@@ -109,7 +143,11 @@ router.post('/', authMiddleware, async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ message: `매장 "${storeName}"이 등록되었습니다. (총 발행량: ${totalCnt})`, store: data[0] });
+    const message = todayStores.length > 0
+      ? `매장 "${storeName}"이 추가되었습니다. (같은 날짜 매장들 통합: 총 발행량 ${finalTotalCount})`
+      : `매장 "${storeName}"이 등록되었습니다. (총 발행량: ${finalTotalCount})`;
+
+    res.json({ message, store: data[0] });
   } catch (error) {
     console.error('매장 생성 오류:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
