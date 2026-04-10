@@ -9,7 +9,7 @@ router.get('/', authMiddleware, async (req, res) => {
   try {
     let query = supabase
       .from('tasks')
-      .select('id, place_name, stars, image_uploaded, status, review_status, image_status, current_step, notes, work_account, user_id, store_id, task_id, completed_count, created_at, updated_at, user:user_id(user_id, superior_name), store:store_id(id, store_name, daily_frequency, total_count, user_id)')
+      .select('id, place_name, stars, image_uploaded, status, review_status, image_status, current_step, notes, work_account, user_id, store_id, task_id, completed_count, created_at, updated_at, review_share_link, user:user_id(user_id, superior_name), store:store_id(id, store_name, daily_frequency, total_count, owner:user_id(user_id))')
       .order('created_at', { ascending: false });
 
     // agency 권한: 자신이 소유한 매장의 작업만 조회 (store_id로 필터링)
