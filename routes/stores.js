@@ -12,6 +12,72 @@ try {
 }
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // allow larger original, we'll resize server-side if sharp available
 
+// ===== Ollama 헬스 체크 함수 (모델 확인 포함) =====
+async function checkOllamaHealth(ollamaUrl, ollamaModel) {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000); // 5초 타임아웃
+    
+    const response = await fetch(`${ollamaUrl}/api/tags`, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    // API 응답 확인
+    if (!response.ok) {
+      return { ok: false, reason: 'API 응답 실패' };
+    }
+    
+    // 모델 설치 확인 (태그 무시)
+    if (ollamaModel) {
+      const data = await response.json();
+      const models = data.models || [];
+      const modelFound = models.find(m => {
+        const baseName = m.name.split(':')[0];
+        return baseName === ollamaModel || m.name === ollamaModel;
+      });
+      
+      if (!modelFound) {
+        return { ok: false, reason: `${ollamaModel} 모델을 찾을 수 없음` };
+      }
+    }
+    
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: error.message };
+  }
+}
+
+// ===== Ollama 헬스 체크 엔드포인트 =====
+router.get('/health/ollama', async (req, res) => {
+  try {
+    const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
+    const ollamaModel = process.env.OLLAMA_MODEL || 'neural-chat';
+    const health = await checkOllamaHealth(ollamaUrl, ollamaModel);
+    
+    if (health.ok) {
+      return res.json({ 
+        status: 'healthy', 
+        url: ollamaUrl,
+        model: ollamaModel,
+        message: 'Ollama가 정상 작동 중입니다.' 
+      });
+    } else {
+      return res.status(503).json({ 
+        status: 'unhealthy', 
+        url: ollamaUrl,
+        model: ollamaModel,
+        reason: health.reason,
+        suggestion: `ollama run ${ollamaModel}`
+      });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // 매장 조회 (관리자: 모든 매장, 일반 사용자: 자신의 매장)
 router.get('/', authMiddleware, async (req, res) => {
   try {
@@ -91,11 +157,17 @@ router.post('/', authMiddleware, async (req, res) => {
     // 같은 이름 + 같은 날짜의 매장들 조회
     const { data: existingStores, error: checkError } = await supabase
       .from('stores')
-      .select('id, total_count, created_at')
+      .select('id, total_count, created_at, user_id')
       .eq('store_name', storeName)
       .eq('user_id', req.user.id);
 
     if (checkError) throw checkError;
+
+    console.log(`🔍 같은 매장명 "${storeName}" 조회 결과 (사용자: ${req.user.id}):`);
+    console.log(`   - 전체 개수: ${existingStores?.length || 0}개`);
+    if (existingStores && existingStores.length > 0) {
+      console.log(`   - 데이터:`, existingStores.map(s => ({ id: s.id, total_count: s.total_count, user_id: s.user_id })));
+    }
 
     // 오늘 등록된 같은 이름의 매장들 필터링
     const todayStores = (existingStores || []).filter(store => {
@@ -103,23 +175,32 @@ router.post('/', authMiddleware, async (req, res) => {
       return storeDate === today;
     });
 
+    console.log(`   - 오늘 등록된 개수: ${todayStores.length}개`);
+    if (todayStores.length > 0) {
+      console.log(`   - 오늘 데이터:`, todayStores.map(s => ({ id: s.id, total_count: s.total_count })));
+    }
+
     let finalTotalCount = totalCnt;
 
     if (todayStores && todayStores.length > 0) {
-      // 오늘 등록된 같은 이름 매장들의 합 + 새로운 값 = 최종 total_count
-      const sumOfExisting = todayStores.reduce((sum, store) => sum + (store.total_count || 0), 0);
-      finalTotalCount = sumOfExisting + totalCnt;
-
-      // 📌 기존의 모든 같은 날짜 매장들의 total_count를 최종값으로 통일
-      for (const store of todayStores) {
+      // ✅ 각 매장에 순환번호 부여 (1착, 2착, 3착...)
+      // 기존 매장들의 total_count를 1부터 순서대로 업데이트
+      for (let i = 0; i < todayStores.length; i++) {
+        const sequenceNumber = i + 1; // 1, 2, 3, ...
+        console.log(`   - 기존 업데이트: 매장ID ${todayStores[i].id} → total_count: ${sequenceNumber}`);
+        
         await supabase
           .from('stores')
           .update({
-            total_count: finalTotalCount,
+            total_count: sequenceNumber,
             updated_at: new Date().toISOString(),
           })
-          .eq('id', store.id);
+          .eq('id', todayStores[i].id);
       }
+      
+      // 새 매장은 다음 번호 (길이 + 1)
+      finalTotalCount = todayStores.length + 1;
+      console.log(`📊 새 매장 순번: ${finalTotalCount}`);
     }
 
     // 📌 새 매장 생성 (deployed_count: 0)
@@ -337,27 +418,27 @@ router.put('/:id', authMiddleware, async (req, res) => {
         });
 
         if (targetStores && targetStores.length > 0) {
-          // 📌 같은 날짜에 같은 새 이름의 매장들이 있으면, 모두 통합
-          const sumOfTargets = targetStores.reduce((sum, s) => sum + (s.total_count || 0), 0);
-          const mergedTotalCount = sumOfTargets + totalCnt;
-
-          // 모든 같은 날짜의 대상 매장들의 total_count를 통합값으로 업데이트
-          for (const targetStore of targetStores) {
+          // ✅ 각 매장에 순환번호 부여
+          for (let i = 0; i < targetStores.length; i++) {
+            const sequenceNumber = i + 1;
             await supabase
               .from('stores')
               .update({
-                total_count: mergedTotalCount,
+                total_count: sequenceNumber,
                 updated_at: new Date().toISOString(),
               })
-              .eq('id', targetStore.id);
+              .eq('id', targetStores[i].id);
           }
 
-          // 현재 매장도 같은 merged값으로 업데이트 후 이름 변경
+          // 현재 매장은 다음 번호
+          const currentStoreNumber = targetStores.length + 1;
+
+          // 현재 매장도 같은 번호로 업데이트 후 이름 변경
           const { data: updatedStore, error: updateError } = await supabase
             .from('stores')
             .update({
               store_name: storeName,
-              total_count: mergedTotalCount,
+              total_count: currentStoreNumber,
               deployed_count: store.deployed_count || 0,
               updated_at: new Date().toISOString(),
             })
@@ -367,7 +448,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
           if (updateError) throw updateError;
 
           return res.json({ 
-            message: `매장 이름이 변경되었습니다. (같은 날짜 매장들 통합: 총 발행량 ${mergedTotalCount})`, 
+            message: `매장 이름이 변경되었습니다. (같은 날짜 매장들 순번 정렬됨)`, 
             store: updatedStore[0]
           });
         }
@@ -393,22 +474,22 @@ router.put('/:id', authMiddleware, async (req, res) => {
         });
 
         if (todayStores && todayStores.length > 0) {
-          // 모든 같은 날짜 매장들의 합 + 새 total_count = 최종값
-          const sumOfExisting = todayStores.reduce((sum, s) => sum + (s.total_count || 0), 0);
-          const newFinalTotalCount = sumOfExisting + totalCnt;
-
-          // 모든 같은 날짜 매장들의 total_count를 최종값으로 통일
-          for (const sameStore of todayStores) {
+          // ✅ 각 매장에 순환번호 부여
+          for (let i = 0; i < todayStores.length; i++) {
+            const sequenceNumber = i + 1;
             await supabase
               .from('stores')
               .update({
-                total_count: newFinalTotalCount,
+                total_count: sequenceNumber,
                 updated_at: new Date().toISOString(),
               })
-              .eq('id', sameStore.id);
+              .eq('id', todayStores[i].id);
           }
 
-          // 현재 매장도 최종값으로 업데이트
+          // 현재 매장은 다음 번호
+          const currentStoreNumber = todayStores.length + 1;
+
+          // 현재 매장도 새 번호로 업데이트
           const { data: updatedStore, error: updateError } = await supabase
             .from('stores')
             .update({
@@ -418,7 +499,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
               draft_reviews: draftReviews || '',
               image_urls: processedImageUrls,
               daily_frequency: dailyFreq,
-              total_count: newFinalTotalCount,
+              total_count: currentStoreNumber,
               deployed_count: store.deployed_count || 0,
               updated_at: new Date().toISOString(),
             })
@@ -428,7 +509,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
           if (updateError) throw updateError;
 
           return res.json({ 
-            message: `매장이 수정되었습니다. (같은 날짜 매장들 통합: 총 발행량 ${newFinalTotalCount})`,
+            message: `매장이 수정되었습니다. (같은 날짜 매장들 순번 정렬됨)`,
             store: updatedStore[0] 
           });
         }
@@ -454,7 +535,17 @@ router.put('/:id', authMiddleware, async (req, res) => {
 
     if (error) throw error;
 
-    res.json({ message: '매장이 수정되었습니다.', store: data[0] });
+    // 📊 총발행수 변경 감지 로그
+    if (totalCnt !== store.total_count) {
+      console.log(`📝 매장 ID ${req.params.id} 총발행수 수정: ${store.total_count} → ${totalCnt}`);
+    }
+
+    res.json({ 
+      message: totalCnt !== store.total_count 
+        ? `매장이 수정되었습니다. (총발행수: ${store.total_count} → ${totalCnt})` 
+        : '매장이 수정되었습니다.',
+      store: data[0] 
+    });
   } catch (error) {
     console.error('매장 수정 오류:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
@@ -613,79 +704,154 @@ router.post('/generate-review', authMiddleware, async (req, res) => {
     const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
     const ollamaModel = process.env.OLLAMA_MODEL || 'neural-chat';
 
-    // 프롬프트 구성 (한글 리뷰 생성용)
-    const prompt = `다음 가이드를 바탕으로 구글맵 리뷰를 한글로 자연스럽게 작성해주세요. 150자 이내로, 존댓말로 작성하세요.
-가이드: ${guidance.trim()}
+    // Ollama 연결 상태 확인
+    console.log(`🔍 Ollama 연결 확인 중: ${ollamaUrl}`);
+    const health = await checkOllamaHealth(ollamaUrl, ollamaModel);
+    
+    if (!health.ok) {
+      console.error(`❌ Ollama 확인 실패: ${health.reason}`);
+      return res.status(503).json({
+        error: 'AI 서비스 준비 실패',
+        details: health.reason,
+        solution: [
+          `1. 터미널에서 다음 명령 실행: ollama run ${ollamaModel}`,
+          `2. 모델이 다운로드/로드될 때까지 대기`,
+          `3. .env에서 OLLAMA_MODEL=${ollamaModel} 확인`
+        ]
+      });
+    }
+    
+    console.log(`✅ Ollama 정상: ${ollamaUrl} (모델: ${ollamaModel})`);
 
-리뷰: `;
+    // 프롬프트 구성 (명시적인 한국어 지시)
+    const prompt = `Answer in Korean only. Write a Google Maps review in Korean (한국어로만 작성).
+Guidelines: ${guidance.trim()}
+Requirements: 
+- Exactly 150 characters or less
+- Polite/formal tone (존댓말)
+- Only Korean text, no English
+- No emojis
+
+Google Maps Review (한국어로만):`;
 
     console.log(`🤖 Ollama 호출: ${ollamaUrl}/api/generate (모델: ${ollamaModel})`);
 
-    // Ollama API 호출
-    const response = await fetch(`${ollamaUrl}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: ollamaModel,
-        prompt: prompt,
-        stream: false,
-        options: {
-          temperature: 0.7,
-          top_p: 0.9,
-          top_k: 40,
-          repeat_penalty: 1.1,
-        },
-      }),
-    });
+    // Ollama API 호출 (환경변수로 타임아웃 설정 가능, 기본 300초)
+    const ollamaTimeout = parseInt(process.env.OLLAMA_TIMEOUT || '300000', 10);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), ollamaTimeout);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('Ollama API 오류:', response.status, errorText);
+    try {
+      const response = await fetch(`${ollamaUrl}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: ollamaModel,
+          prompt: prompt,
+          stream: false,
+          options: {
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: 40,
+            repeat_penalty: 1.1,
+          },
+        }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Ollama API 오류:', response.status, errorText);
+        
+        return res.status(500).json({
+          error: 'AI 리뷰 생성 실패',
+          details: errorText || 'Ollama 응답 오류',
+        });
+      }
+
+      const data = await response.json();
       
-      // 연결 오류인 경우
-      if (response.status === 0 || !response.ok) {
-        return res.status(503).json({
-          error: 'AI 서비스 연결 실패',
-          details: 'Ollama가 실행 중이지 않습니다. 터미널에서 "ollama run neural-chat" 실행하세요.',
+      if (!data.response) {
+        return res.status(500).json({
+          error: 'AI 응답 형식 오류',
+          details: '모델에서 응답을 받지 못했습니다.',
+        });
+      }
+
+      let reviewText = data.response.trim();
+
+      console.log(`📝 원본 응답 길이: ${reviewText.length}자`);
+      console.log(`📝 원본 응답: "${reviewText.substring(0, 100)}..."`);
+
+      // 프롬프트 부분 제거 (간단하게)
+      // "Google Maps Review" 또는 "리뷰:" 다음의 내용만 추출
+      if (reviewText.includes('Google Maps Review')) {
+        reviewText = reviewText.split('Google Maps Review')[1].trim();
+      }
+      if (reviewText.includes(':')) {
+        reviewText = reviewText.split(':').slice(1).join(':').trim();
+      }
+
+      console.log(`🧹 정리 후: "${reviewText.substring(0, 100)}..."`);
+
+      // 첫 번째 라인만 추출
+      const lines = reviewText.split('\n').filter(l => l.trim().length > 0);
+      let finalReview = lines.length > 0 ? lines[0] : reviewText;
+
+      console.log(`📊 첫 줄: "${finalReview.substring(0, 100)}..."`);
+
+      // 150자 제한
+      finalReview = finalReview.substring(0, 150).trim();
+
+      console.log(`✅ 최종 리뷰: "${finalReview}"`);
+      console.log(`✅ AI 리뷰 생성 완료 (${finalReview.length}자)`);
+
+      if (!finalReview) {
+        console.error('❌ 최종 리뷰가 비어있습니다!');
+        return res.status(500).json({
+          error: 'AI 응답 처리 오류',
+          details: '생성된 리뷰가 비어있습니다.',
+          debug: { original: data.response }
+        });
+      }
+
+      return res.json({
+        review: finalReview,
+        source: 'Ollama',
+        model: ollamaModel,
+      });
+    } catch (fetchError) {
+      clearTimeout(timeoutId);
+      const timeoutSeconds = Math.floor(ollamaTimeout / 1000);
+      
+      // 타임아웃 오류 처리
+      if (fetchError.name === 'AbortError') {
+        console.error(`❌ Ollama 응답 타임아웃 (${timeoutSeconds}초):`, fetchError);
+        return res.status(504).json({
+          error: 'AI 서비스 응답 지연',
+          details: `${ollamaModel} 모델 응답이 ${timeoutSeconds}초 이상 걸렸습니다.`,
+          recommendations: [
+            '1. 더 빠른 모델 사용: OLLAMA_MODEL=orca-mini',
+            '2. 서버 메모리 상태 확인',
+            `3. 타임아웃 증가: OLLAMA_TIMEOUT=600000 npm start`,
+          ]
         });
       }
       
-      return res.status(500).json({
-        error: 'AI 리뷰 생성 실패',
-        details: errorText,
-      });
+      // 연결 오류 처리
+      if (fetchError.cause?.code === 'UND_ERR_HEADERS_TIMEOUT' || fetchError.message === 'fetch failed') {
+        console.error('❌ Ollama 연결 오류:', fetchError.cause?.code || fetchError.message);
+        return res.status(503).json({
+          error: 'AI 서비스 연결 실패',
+          details: 'Ollama가 응답하지 않습니다.',
+          solution: `ollama run ${ollamaModel}`
+        });
+      }
+      
+      throw fetchError;
     }
-
-    const data = await response.json();
-    
-    if (!data.response) {
-      return res.status(500).json({
-        error: 'AI 응답 형식 오류',
-        details: '모델에서 응답을 받지 못했습니다.',
-      });
-    }
-
-    let reviewText = data.response.trim();
-
-    // 프롬프트 제거 (응답에 프롬프트가 포함되어 있을 경우)
-    if (reviewText.includes('리뷰:')) {
-      const parts = reviewText.split('리뷰:');
-      reviewText = parts[parts.length - 1].trim();
-    }
-
-    // 첫 번째 문장이나 150자 이내로 정리
-    const lines = reviewText.split('\n').filter(l => l.trim().length > 0);
-    const finalReview = lines.length > 0 
-      ? lines[0].substring(0, 150).trim()
-      : reviewText.substring(0, 150).trim();
-
-    console.log(`✅ AI 리뷰 생성 완료: ${finalReview.substring(0, 50)}...`);
-
-    res.json({
-      review: finalReview,
-      source: 'Ollama',
-      model: ollamaModel,
-    });
   } catch (error) {
     console.error('리뷰 생성 오류:', error);
     res.status(500).json({ 
