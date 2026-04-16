@@ -1,6 +1,7 @@
 const express = require('express');
 const supabase = require('../supabaseClient');
 const authMiddleware = require('../auth-middleware');
+const { GoogleGenAI } = require('@google/genai');
 
 const router = express.Router();
 const multer = require('multer');
@@ -12,71 +13,49 @@ try {
 }
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // allow larger original, we'll resize server-side if sharp available
 
-// ===== Ollama 헬스 체크 함수 (모델 확인 포함) =====
-async function checkOllamaHealth(ollamaUrl, ollamaModel) {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000); // 5초 타임아웃
-    
-    const response = await fetch(`${ollamaUrl}/api/tags`, {
-      method: 'GET',
-      signal: controller.signal,
-    });
-    
-    clearTimeout(timeoutId);
-    
-    // API 응답 확인
-    if (!response.ok) {
-      return { ok: false, reason: 'API 응답 실패' };
-    }
-    
-    // 모델 설치 확인 (태그 무시)
-    if (ollamaModel) {
-      const data = await response.json();
-      const models = data.models || [];
-      const modelFound = models.find(m => {
-        const baseName = m.name.split(':')[0];
-        return baseName === ollamaModel || m.name === ollamaModel;
-      });
-      
-      if (!modelFound) {
-        return { ok: false, reason: `${ollamaModel} 모델을 찾을 수 없음` };
-      }
-    }
-    
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, reason: error.message };
-  }
+const aiStudioApiKey = process.env.GOOGLE_AI_STUDIO_API_KEY;
+const aiStudioEndpoint = process.env.GOOGLE_AI_STUDIO_ENDPOINT;
+const aiStudioTimeout = parseInt(process.env.GOOGLE_AI_STUDIO_TIMEOUT || '120000', 10);
+
+function getAiStudioModelFromEndpoint() {
+  return 'gemini-2.5-flash-lite';
 }
 
-// ===== Ollama 헬스 체크 엔드포인트 =====
-router.get('/health/ollama', async (req, res) => {
-  try {
-    const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
-    const ollamaModel = process.env.OLLAMA_MODEL || 'neural-chat';
-    const health = await checkOllamaHealth(ollamaUrl, ollamaModel);
-    
-    if (health.ok) {
-      return res.json({ 
-        status: 'healthy', 
-        url: ollamaUrl,
-        model: ollamaModel,
-        message: 'Ollama가 정상 작동 중입니다.' 
-      });
-    } else {
-      return res.status(503).json({ 
-        status: 'unhealthy', 
-        url: ollamaUrl,
-        model: ollamaModel,
-        reason: health.reason,
-        suggestion: `ollama run ${ollamaModel}`
-      });
-    }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+async function callGoogleAIStudio(prompt, timeoutMs = null) {
+  if (!aiStudioApiKey) {
+    throw new Error('Google AI Studio 설정이 누락되었습니다. .env에서 GOOGLE_AI_STUDIO_API_KEY를 확인하세요.');
   }
-});
+
+  const ai = new GoogleGenAI({
+    apiKey: aiStudioApiKey,
+  });
+
+  const model = getAiStudioModelFromEndpoint();
+
+  const contents = [
+    {
+      role: 'user',
+      parts: [
+        {
+          text: prompt,
+        },
+      ],
+    },
+  ];
+
+  const response = await ai.models.generateContent({
+    model,
+    contents,
+  });
+
+  const candidate = response.candidates[0].content.parts[0].text;
+
+  if (!candidate || typeof candidate !== 'string') {
+    throw new Error('Google AI Studio 응답 형식 오류');
+  }
+
+  return candidate.trim();
+}
 
 // 매장 조회 (관리자: 모든 매장, 일반 사용자: 자신의 매장)
 router.get('/', authMiddleware, async (req, res) => {
@@ -721,7 +700,7 @@ router.delete('/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// AI 리뷰 생성 엔드포인트 (Ollama)
+// AI 리뷰 생성 엔드포인트 (Google AI Studio)
 router.post('/generate-review', authMiddleware, async (req, res) => {
   try {
     const { guidance } = req.body;
@@ -730,30 +709,10 @@ router.post('/generate-review', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: '리뷰 가이드를 입력하세요.' });
     }
 
-    const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
-    const ollamaModel = process.env.OLLAMA_MODEL || 'neural-chat';
+    const aiModel = getAiStudioModelFromEndpoint();
+    console.log(`🔍 Google AI Studio 호출: ${aiStudioEndpoint} (모델: ${aiModel})`);
 
-    // Ollama 연결 상태 확인
-    console.log(`🔍 Ollama 연결 확인 중: ${ollamaUrl}`);
-    const health = await checkOllamaHealth(ollamaUrl, ollamaModel);
-    
-    if (!health.ok) {
-      console.error(`❌ Ollama 확인 실패: ${health.reason}`);
-      return res.status(503).json({
-        error: 'AI 서비스 준비 실패',
-        details: health.reason,
-        solution: [
-          `1. 터미널에서 다음 명령 실행: ollama run ${ollamaModel}`,
-          `2. 모델이 다운로드/로드될 때까지 대기`,
-          `3. .env에서 OLLAMA_MODEL=${ollamaModel} 확인`
-        ]
-      });
-    }
-    
-    console.log(`✅ Ollama 정상: ${ollamaUrl} (모델: ${ollamaModel})`);
-
-    // 프롬프트 구성 (한국어 리뷰만 강력히 요청)
-    const prompt = `당신은 한국어로만 사용자 리뷰를 작성하는 사용자입니다. 한글로 작성해주세요.
+    const prompt = `당신은 한국어로만 사용자 리뷰를 작성하는 전문가입니다. 한글로 작성해주세요.
 아래 지시를 반드시 지키세요.
 
 가이드: ${guidance.trim()}
@@ -764,136 +723,56 @@ router.post('/generate-review', authMiddleware, async (req, res) => {
 - 존댓말로 부드럽게 작성
 - 여성스러운 말투로 작성
 - 이모지 사용 금지
-- 사용자리뷰 내용 작성
+- 사용자 리뷰 내용만 작성
 - 질문이나 안내 문장은 작성하지 않음
 
-출력은 오직 한 개의 한국어 리뷰 문장만으로 구성되어야 합니다.
+출력은 오직 한 개의 한국어 리뷰 문장으로 구성되어야 합니다.
 
 리뷰(한국어):`;
 
-    console.log(`🤖 Ollama 호출: ${ollamaUrl}/api/generate (모델: ${ollamaModel})`);
+    const responseText = await callGoogleAIStudio(prompt);
+    console.log(`🤖 AI 응답 원본: "${responseText.substring(0, 150)}"`);
 
-    // Ollama API 호출 (환경변수로 타임아웃 설정 가능, 기본 600초)
-    const ollamaTimeout = parseInt(process.env.OLLAMA_TIMEOUT || '600000', 10);
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), ollamaTimeout);
-
-    try {
-      const response = await fetch(`${ollamaUrl}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: ollamaModel,
-          prompt: prompt,
-          stream: false,
-          options: {
-            temperature: 0.3,
-            top_p: 0.8,
-            top_k: 40,
-            repeat_penalty: 1.1,
-          },
-        }),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('Ollama API 오류:', response.status, errorText);
-        
-        return res.status(500).json({
-          error: 'AI 리뷰 생성 실패',
-          details: errorText || 'Ollama 응답 오류',
-        });
-      }
-
-      const data = await response.json();
-      
-      if (!data.response) {
-        return res.status(500).json({
-          error: 'AI 응답 형식 오류',
-          details: '모델에서 응답을 받지 못했습니다.',
-        });
-      }
-
-      let reviewText = data.response.trim();
-
-      console.log(`📝 원본 응답 길이: ${reviewText.length}자`);
-      console.log(`📝 원본 응답: "${reviewText.substring(0, 100)}..."`);
-
-      // 프롬프트 부분 제거 (간단하게)
-      // "Google Maps Review" 또는 "리뷰:" 다음의 내용만 추출
-      if (reviewText.includes('Google Maps Review')) {
-        reviewText = reviewText.split('Google Maps Review')[1].trim();
-      }
-      if (reviewText.includes(':')) {
-        reviewText = reviewText.split(':').slice(1).join(':').trim();
-      }
-
-      console.log(`🧹 정리 후: "${reviewText.substring(0, 100)}..."`);
-
-      // 첫 번째 라인만 추출
-      const lines = reviewText.split('\n').filter(l => l.trim().length > 0);
-      let finalReview = lines.length > 0 ? lines[0] : reviewText;
-
-      console.log(`📊 첫 줄: "${finalReview.substring(0, 100)}..."`);
-
-      // 150자 제한
-      finalReview = finalReview.substring(0, 150).trim();
-
-      console.log(`✅ 최종 리뷰: "${finalReview}"`);
-      console.log(`✅ AI 리뷰 생성 완료 (${finalReview.length}자)`);
-
-      if (!finalReview) {
-        console.error('❌ 최종 리뷰가 비어있습니다!');
-        return res.status(500).json({
-          error: 'AI 응답 처리 오류',
-          details: '생성된 리뷰가 비어있습니다.',
-          debug: { original: data.response }
-        });
-      }
-
-      return res.json({
-        review: finalReview,
-        source: 'Ollama',
-        model: ollamaModel,
-      });
-    } catch (fetchError) {
-      clearTimeout(timeoutId);
-      const timeoutSeconds = Math.floor(ollamaTimeout / 1000);
-      
-      // 타임아웃 오류 처리
-      if (fetchError.name === 'AbortError') {
-        console.error(`❌ Ollama 응답 타임아웃 (${timeoutSeconds}초):`, fetchError);
-        return res.status(504).json({
-          error: 'AI 서비스 응답 지연',
-          details: `${ollamaModel} 모델 응답이 ${timeoutSeconds}초 이상 걸렸습니다.`,
-          recommendations: [
-            '1. 더 빠른 모델 사용: OLLAMA_MODEL=orca-mini',
-            '2. 서버 메모리 상태 확인',
-            `3. 타임아웃 증가: OLLAMA_TIMEOUT=600000 npm start`,
-          ]
-        });
-      }
-      
-      // 연결 오류 처리
-      if (fetchError.cause?.code === 'UND_ERR_HEADERS_TIMEOUT' || fetchError.message === 'fetch failed') {
-        console.error('❌ Ollama 연결 오류:', fetchError.cause?.code || fetchError.message);
-        return res.status(503).json({
-          error: 'AI 서비스 연결 실패',
-          details: 'Ollama가 응답하지 않습니다.',
-          solution: `ollama run ${ollamaModel}`
-        });
-      }
-      
-      throw fetchError;
+    let reviewText = responseText;
+    if (reviewText.includes('Google Maps Review')) {
+      reviewText = reviewText.split('Google Maps Review')[1].trim();
     }
+    if (reviewText.includes(':')) {
+      reviewText = reviewText.split(':').slice(1).join(':').trim();
+    }
+
+    const lines = reviewText.split('\n').filter(l => l.trim().length > 0);
+    let finalReview = lines.length > 0 ? lines[0] : reviewText;
+    finalReview = finalReview.substring(0, 150).trim();
+
+    if (!finalReview) {
+      console.error('❌ 최종 리뷰가 비어있습니다!');
+      return res.status(500).json({
+        error: 'AI 응답 처리 오류',
+        details: '생성된 리뷰가 비어있습니다.',
+        debug: { original: responseText }
+      });
+    }
+
+    console.log(`✅ 최종 리뷰: "${finalReview}"`);
+
+    return res.json({
+      review: finalReview,
+      source: 'Google AI Studio',
+      model: aiModel,
+    });
   } catch (error) {
+    if (error.name === 'AbortError') {
+      return res.status(504).json({
+        error: 'AI 서비스 응답 지연',
+        details: `Google AI Studio 응답이 ${Math.floor(aiStudioTimeout / 1000)}초 이상 소요되었습니다.`,
+      });
+    }
+
     console.error('리뷰 생성 오류:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: '리뷰 생성 중 오류가 발생했습니다.',
-      details: error.message 
+      details: error.message,
     });
   }
 });
@@ -911,14 +790,12 @@ router.post('/generate-reviews', authMiddleware, async (req, res) => {
     }
 
     const reviewCount = Math.min(Math.max(1, parseInt(count) || 1), 100);
-    const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
-    const ollamaModel = process.env.OLLAMA_MODEL || 'neural-chat';
+    const aiModel = getAiStudioModelFromEndpoint();
 
-    console.log(`🔧 설정: URL=${ollamaUrl}, 모델=${ollamaModel}, 생성 개수=${reviewCount}`);
+    console.log(`🔧 설정: endpoint=${aiStudioEndpoint}, 모델=${aiModel}, 생성 개수=${reviewCount}`);
 
     const generatedReviews = [];
 
-    // 순차적으로 리뷰 생성
     for (let i = 0; i < reviewCount; i++) {
       const prompt = `당신은 한국어로만 구글 지도 리뷰를 작성하는 전문가입니다. 절대 영어를 사용하지 마세요.
 아래 지시를 반드시 지키세요.
@@ -933,71 +810,21 @@ router.post('/generate-reviews', authMiddleware, async (req, res) => {
 - 리뷰 내용만 작성
 - 질문이나 안내 문장은 작성하지 않음
 
-출력은 오직 한 개의 한국어 리뷰 문장만으로 구성되어야 합니다.
+출력은 오직 한 개의 한국어 리뷰 문장으로 구성되어야 합니다.
 
-리뷰(한국어): `;
+리뷰(한국어):`;
 
       try {
-        console.log(`📤 Ollama 요청 시작 (${i + 1}/${reviewCount}): ${ollamaUrl}/api/generate`);
-        
-        // AbortController로 타임아웃 설정 (120초)
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => {
-          console.error(`⏰ 타임아웃 (${i + 1}/${reviewCount}): 600초 초과`);
-          controller.abort();
-        }, 600000);
+        console.log(`📤 AI 요청 시작 (${i + 1}/${reviewCount})`);
+        const responseText = await callGoogleAIStudio(prompt);
 
-        const response = await fetch(`${ollamaUrl}/api/generate`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: ollamaModel,
-            prompt: prompt,
-            stream: false,
-            options: {
-              temperature: 0.3,
-              top_p: 0.8,
-              top_k: 40,
-              repeat_penalty: 1.1,
-            },
-          }),
-          signal: controller.signal,
-        });
-
-        clearTimeout(timeoutId);
-
-        console.log(`📨 Ollama 응답 받음 (${i + 1}/${reviewCount}): ${response.status}`);
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          console.error(`❌ Ollama API 오류 (${i + 1}/${reviewCount}):`, response.status, errorText);
-          continue; // 실패한 리뷰는 건너뛰고 계속 진행
-          
-        }
-
-        const data = await response.json();
-        console.log(`📦 JSON 파싱 성공 (${i + 1}/${reviewCount}), 응답 길이:`, data.response?.length);
-        
-        if (!data.response) {
-          console.warn(`⚠️ 응답이 없음 (${i + 1}/${reviewCount}), 건너뛰기`);
-          continue; // 응답이 없으면 건너뛰기
-        }
-
-        let reviewText = data.response.trim();
-        console.log(`✂️ 원본 (${i + 1}/${reviewCount}):`, reviewText.substring(0, 50));
-
-        // 프롬프트 제거
+        let reviewText = responseText;
         if (reviewText.includes('리뷰:')) {
-          const parts = reviewText.split('리뷰:');
-          reviewText = parts[parts.length - 1].trim();
-          console.log(`✂️ 정제 후 (${i + 1}/${reviewCount}):`, reviewText.substring(0, 50));
+          reviewText = reviewText.split('리뷰:').slice(1).join('리뷰:').trim();
         }
 
-        // 100자 이내로 제한
         const lines = reviewText.split('\n').filter(l => l.trim().length > 0);
-        const finalReview = lines.length > 0 
-          ? lines[0].substring(0, 100).trim()
-          : reviewText.substring(0, 100).trim();
+        const finalReview = (lines.length > 0 ? lines[0] : reviewText).substring(0, 100).trim();
 
         if (finalReview.length > 0) {
           generatedReviews.push({
@@ -1005,12 +832,12 @@ router.post('/generate-reviews', authMiddleware, async (req, res) => {
             text: finalReview,
             length: finalReview.length,
           });
-          console.log(`✅ 리뷰 저장 (${i + 1}/${reviewCount}): ${finalReview.substring(0, 30)}...`);
+          console.log(`✅ 리뷰 생성 (${i + 1}/${reviewCount}): ${finalReview}`);
         } else {
           console.warn(`⚠️ 최종 리뷰가 빈 문자열 (${i + 1}/${reviewCount}), 건너뛰기`);
         }
       } catch (innerError) {
-        console.error(`리뷰 생성 실패 (${i + 1}/${reviewCount}):`, innerError);
+        console.error(`리뷰 생성 실패 (${i + 1}/${reviewCount}):`, innerError.message || innerError);
         continue;
       }
     }
@@ -1027,16 +854,17 @@ router.post('/generate-reviews', authMiddleware, async (req, res) => {
     res.json({
       reviews: generatedReviews,
       count: generatedReviews.length,
-      source: 'Ollama',
-      model: ollamaModel,
+      source: 'Google AI Studio',
+      model: aiModel,
     });
   } catch (error) {
     console.error('다중 리뷰 생성 오류:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: '리뷰 생성 중 오류가 발생했습니다.',
-      details: error.message 
+      details: error.message,
     });
   }
 });
 
 module.exports = router;
+
