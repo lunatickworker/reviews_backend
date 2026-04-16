@@ -723,21 +723,23 @@ router.post('/generate-review', authMiddleware, async (req, res) => {
     
     console.log(`✅ Ollama 정상: ${ollamaUrl} (모델: ${ollamaModel})`);
 
-    // 프롬프트 구성 (명시적인 한국어 지시)
-    const prompt = `Answer in Korean only. Write a Google Maps review in Korean (한국어로만 작성).
-Guidelines: ${guidance.trim()}
-Requirements: 
-- Exactly 150 characters or less
-- Polite/formal tone (존댓말)
-- Only Korean text, no English
-- No emojis
+    // 프롬프트 구성 (간단하고 명확한 한국어 지시)
+    const prompt = `다음 가이드를 참고해서 구글 지도 리뷰를 작성해주세요.
 
-Google Maps Review (한국어로만):`;
+가이드: ${guidance.trim()}
+
+요구사항:
+- 150자 이내로 작성
+- 여성스러운 부드러운 말투로 작성
+- 한국어로만 작성
+- 이모지 사용하지 않음
+
+리뷰:`;
 
     console.log(`🤖 Ollama 호출: ${ollamaUrl}/api/generate (모델: ${ollamaModel})`);
 
-    // Ollama API 호출 (환경변수로 타임아웃 설정 가능, 기본 300초)
-    const ollamaTimeout = parseInt(process.env.OLLAMA_TIMEOUT || '300000', 10);
+    // Ollama API 호출 (환경변수로 타임아웃 설정 가능, 기본 600초)
+    const ollamaTimeout = parseInt(process.env.OLLAMA_TIMEOUT || '600000', 10);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), ollamaTimeout);
 
@@ -883,20 +885,27 @@ router.post('/generate-reviews', authMiddleware, async (req, res) => {
 
     // 순차적으로 리뷰 생성
     for (let i = 0; i < reviewCount; i++) {
-      const prompt = `다음 가이드를 바탕으로 구글맵 리뷰를 한글로 자연스럽게 작성해주세요. 100자 이내로, 존댓말로 작성하세요.
+      const prompt = `다음 가이드를 참고해서 구글 지도 리뷰를 작성해주세요.
+
 가이드: ${guidance.trim()}
+
+요구사항:
+- 100자 이내로 작성
+- 존댓말로 작성
+- 한국어로만 작성
+- 이모지 사용하지 않음
 
 리뷰: `;
 
       try {
         console.log(`📤 Ollama 요청 시작 (${i + 1}/${reviewCount}): ${ollamaUrl}/api/generate`);
         
-        // AbortController로 타임아웃 설정 (120초)
+        // AbortController로 타임아웃 설정
         const controller = new AbortController();
         const timeoutId = setTimeout(() => {
-          console.error(`⏰ 타임아웃 (${i + 1}/${reviewCount}): 120초 초과`);
+          console.error(`⏰ 타임아웃 (${i + 1}/${reviewCount}): 600초 초과`);
           controller.abort();
-        }, 120000);
+        }, 600000);
 
         const response = await fetch(`${ollamaUrl}/api/generate`, {
           method: 'POST',
