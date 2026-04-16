@@ -29,8 +29,8 @@ router.get('/', authMiddleware, async (req, res) => {
       if (storeIds.length > 0) {
         query = query.in('store_id', storeIds);
       } else {
-        // store가 없으면 빈 결과 반환 (불가능한 조건)
-        query = query.eq('store_id', null);
+        // store가 없으면 빈 결과 반환
+        return res.json([]);
       }
     }
 
