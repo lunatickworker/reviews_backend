@@ -134,6 +134,15 @@ router.post('/', authMiddleware, async (req, res) => {
   try {
     const { storeName, address, reviewMessage, imageUrls, dailyFrequency, totalCount, draftReviews } = req.body;
 
+    console.log('📝 POST / 매장 생성 요청:');
+    console.log('   - storeName:', storeName);
+    console.log('   - address:', address);
+    console.log('   - reviewMessage:', reviewMessage);
+    console.log('   - dailyFrequency:', dailyFrequency);
+    console.log('   - totalCount:', totalCount);
+    console.log('   - draftReviews:', draftReviews);
+    console.log('   - imageUrls:', imageUrls);
+
     if (!storeName) {
       return res.status(400).json({ error: '매장명을 입력하세요.' });
     }
@@ -224,13 +233,19 @@ router.post('/', authMiddleware, async (req, res) => {
 
     if (error) throw error;
 
+    console.log('✅ 매장 생성 성공:');
+    console.log('   - ID:', data[0]?.id);
+    console.log('   - store_name:', data[0]?.store_name);
+    console.log('   - draft_reviews:', data[0]?.draft_reviews);
+
     const message = todayStores.length > 0
       ? `매장 "${storeName}"이 추가되었습니다. (같은 날짜 매장들 통합: 총 발행량 ${finalTotalCount})`
       : `매장 "${storeName}"이 등록되었습니다. (총 발행량: ${finalTotalCount})`;
 
+    console.log('📤 응답:', { message, store: data[0] });
     res.json({ message, store: data[0] });
   } catch (error) {
-    console.error('매장 생성 오류:', error);
+    console.error('❌ 매장 생성 오류:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
   }
 });
@@ -358,6 +373,15 @@ router.post('/', authMiddleware, async (req, res) => {
 router.put('/:id', authMiddleware, async (req, res) => {
   try {
     const { storeName, address, reviewMessage, imageUrls, dailyFrequency, totalCount, draftReviews } = req.body;
+
+    console.log('✏️ PUT /:id 매장 수정 요청:');
+    console.log('   - id:', req.params.id);
+    console.log('   - storeName:', storeName);
+    console.log('   - address:', address);
+    console.log('   - reviewMessage:', reviewMessage);
+    console.log('   - dailyFrequency:', dailyFrequency);
+    console.log('   - totalCount:', totalCount);
+    console.log('   - draftReviews:', draftReviews);
 
     if (!storeName) {
       return res.status(400).json({ error: '매장명을 입력하세요.' });
@@ -535,6 +559,11 @@ router.put('/:id', authMiddleware, async (req, res) => {
 
     if (error) throw error;
 
+    console.log('✅ 매장 수정 성공:');
+    console.log('   - ID:', data[0]?.id);
+    console.log('   - store_name:', data[0]?.store_name);
+    console.log('   - draft_reviews:', data[0]?.draft_reviews);
+
     // 📊 총발행수 변경 감지 로그
     if (totalCnt !== store.total_count) {
       console.log(`📝 매장 ID ${req.params.id} 총발행수 수정: ${store.total_count} → ${totalCnt}`);
@@ -547,7 +576,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
       store: data[0] 
     });
   } catch (error) {
-    console.error('매장 수정 오류:', error);
+    console.error('❌ 매장 수정 오류:', error);
     res.status(500).json({ error: '서버 오류가 발생했습니다.' });
   }
 });
@@ -723,18 +752,24 @@ router.post('/generate-review', authMiddleware, async (req, res) => {
     
     console.log(`✅ Ollama 정상: ${ollamaUrl} (모델: ${ollamaModel})`);
 
-    // 프롬프트 구성 (간단하고 명확한 한국어 지시)
-    const prompt = `다음 가이드를 참고해서 구글 지도 리뷰를 작성해주세요.
+    // 프롬프트 구성 (한국어 리뷰만 강력히 요청)
+    const prompt = `당신은 한국어로만 사용자 리뷰를 작성하는 사용자입니다. 한글로 작성해주세요.
+아래 지시를 반드시 지키세요.
 
 가이드: ${guidance.trim()}
 
 요구사항:
-- 150자 이내로 작성
-- 여성스러운 부드러운 말투로 작성
-- 한국어로만 작성
-- 이모지 사용하지 않음
+- 반드시 한국어로만 작성
+- 150자 이내
+- 존댓말로 부드럽게 작성
+- 여성스러운 말투로 작성
+- 이모지 사용 금지
+- 사용자리뷰 내용 작성
+- 질문이나 안내 문장은 작성하지 않음
 
-리뷰:`;
+출력은 오직 한 개의 한국어 리뷰 문장만으로 구성되어야 합니다.
+
+리뷰(한국어):`;
 
     console.log(`🤖 Ollama 호출: ${ollamaUrl}/api/generate (모델: ${ollamaModel})`);
 
@@ -752,8 +787,8 @@ router.post('/generate-review', authMiddleware, async (req, res) => {
           prompt: prompt,
           stream: false,
           options: {
-            temperature: 0.7,
-            top_p: 0.9,
+            temperature: 0.3,
+            top_p: 0.8,
             top_k: 40,
             repeat_penalty: 1.1,
           },
@@ -885,22 +920,27 @@ router.post('/generate-reviews', authMiddleware, async (req, res) => {
 
     // 순차적으로 리뷰 생성
     for (let i = 0; i < reviewCount; i++) {
-      const prompt = `다음 가이드를 참고해서 구글 지도 리뷰를 작성해주세요.
+      const prompt = `당신은 한국어로만 구글 지도 리뷰를 작성하는 전문가입니다. 절대 영어를 사용하지 마세요.
+아래 지시를 반드시 지키세요.
 
 가이드: ${guidance.trim()}
 
 요구사항:
-- 100자 이내로 작성
+- 반드시 한국어로만 작성
+- 100자 이내
 - 존댓말로 작성
-- 한국어로만 작성
-- 이모지 사용하지 않음
+- 이모지 사용 금지
+- 리뷰 내용만 작성
+- 질문이나 안내 문장은 작성하지 않음
 
-리뷰: `;
+출력은 오직 한 개의 한국어 리뷰 문장만으로 구성되어야 합니다.
+
+리뷰(한국어): `;
 
       try {
         console.log(`📤 Ollama 요청 시작 (${i + 1}/${reviewCount}): ${ollamaUrl}/api/generate`);
         
-        // AbortController로 타임아웃 설정
+        // AbortController로 타임아웃 설정 (120초)
         const controller = new AbortController();
         const timeoutId = setTimeout(() => {
           console.error(`⏰ 타임아웃 (${i + 1}/${reviewCount}): 600초 초과`);
@@ -915,8 +955,8 @@ router.post('/generate-reviews', authMiddleware, async (req, res) => {
             prompt: prompt,
             stream: false,
             options: {
-              temperature: 0.7,
-              top_p: 0.9,
+              temperature: 0.3,
+              top_p: 0.8,
               top_k: 40,
               repeat_penalty: 1.1,
             },
