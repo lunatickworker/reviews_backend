@@ -719,7 +719,7 @@ router.post('/generate-review', authMiddleware, async (req, res) => {
 
 요구사항:
 - 반드시 한국어로만 작성
-- 150자 이내
+- 공백을 제외하고 140자에서 150자 사이로 작성해주세요
 - 존댓말로 부드럽게 작성
 - 여성스러운 말투로 작성
 - 이모지 사용 금지
@@ -797,14 +797,14 @@ router.post('/generate-reviews', authMiddleware, async (req, res) => {
     const generatedReviews = [];
 
     for (let i = 0; i < reviewCount; i++) {
-      const prompt = `당신은 한국어로만 구글 지도 리뷰를 작성하는 전문가입니다. 절대 영어를 사용하지 마세요.
+      const prompt = `당신은 고객 리뷰를 작성하는 크리에이터입니다. 한국어로 입팩트 있는 리뷰를 작성하세요.
 아래 지시를 반드시 지키세요.
 
 가이드: ${guidance.trim()}
 
 요구사항:
 - 반드시 한국어로만 작성
-- 100자 이내
+- 공백을 제외하고 140자에서 150자 사이로 작성해주세요
 - 존댓말로 작성
 - 이모지 사용 금지
 - 리뷰 내용만 작성

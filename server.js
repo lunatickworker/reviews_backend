@@ -1091,19 +1091,8 @@ async function backgroundTask(page, shortUrl, notes, email, browser, tempDir, us
             }
             
             // 이미지 정보 조회
-            const { data: storeDataFinal } = await supabase
-              .from('stores')
-              .select('image_urls')
-              .eq('id', storeId)
-              .single();
-            
-            const storeHasImages = storeDataFinal?.image_urls && Array.isArray(storeDataFinal.image_urls) && storeDataFinal.image_urls.length > 0;
-            
-            // 카운트 증가 결정
-            const shouldIncrementFinal = 
-              (userChoseImageStatus === 'pending') ? 
-                !storeHasImages : // 리뷰만: 이미지 없을 때만 증가
-                true; // 리뷰+이미지: 항상 증가
+            // 리뷰 또는 리뷰+이미지 완료 상태인 경우 completed_count를 항상 증가시킵니다.
+            const shouldIncrementFinal = true;
             
             if (shouldIncrementFinal) {
               const { data: currentTaskData } = await supabase
